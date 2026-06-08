@@ -1,0 +1,5 @@
+versions/
+*.py
+*.html
+_build*
+*.txt
