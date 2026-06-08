@@ -9,6 +9,7 @@
 // @run-at       document-idle
 // @connect      zhipin.com
 // @connect      api.deepseek.com
+// @license      MIT
 // @noframes
 // ==/UserScript==
  
