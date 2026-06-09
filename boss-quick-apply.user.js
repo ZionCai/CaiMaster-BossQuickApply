@@ -4203,31 +4203,31 @@ updateGreetingPreview(text){var pv=document.getElementById("greeting-preview-tex
         `;
       letterContent.innerHTML = `
             <div style="margin-bottom:20px;">
-                <p>你好，未来的成功人士：</p>
-                <p class="mt-2">&emsp;&emsp;展信如晤。</p>
+                <p>展信佳。</p>
+                <p class="mt-2">&emsp;&emsp;正在困扰于实习面试的朋友：</p>
+                <p class="mt-2">&emsp;&emsp;你好。</p>
                 <p class="mt-3">
-                    &emsp;&emsp;我是Zion Cai，我曾经和你一样在求职路上反复碰壁。
-                    简历石沉大海、面试邀约寥寥、沟通效率低下...于是我做了这个小工具。
+                    &emsp;&emsp;我也许和你一样，是在求职路上奔波的学生。经历过简历石沉大海、面试大脑空白的时刻，也懂得发出消息却无人回应的焦虑。这些重复与内耗，我深有体会。
                 </p>
                 <p class="mt-3">
-                    &emsp;&emsp;现在，我将它分享给你，希望能够帮到你：
+                    &emsp;&emsp;正因如此，我用Claude Code做出了这个小工具。它不替代你的努力，只愿帮你节省时间，让你更专注于真正重要的事。它或许可以为你做这些：
                 </p>
                 <ul class="mt-3 ml-6 list-disc" style="text-indent:0;">
-                    <li><strong>&emsp;&emsp;自动沟通页面岗位</strong>，一键打招呼</li>
-                    <li><strong>&emsp;&emsp;AI智能回复HR提问</strong>，24小时在线不错过任何机会</li>
-                    <li><strong>&emsp;&emsp;个性化沟通策略</strong>，大幅提升面试邀约率</li>
+                    <li>&emsp;&emsp;自动沟通页面岗位，一键打招呼</li>
+                    <li>&emsp;&emsp;AI智能生成契合岗位的招呼语，让每一次沟通都更有温度</li>
+                    <li>&emsp;&emsp;个性化沟通策略，让HR更愿意回应你</li>
                 </ul>
                 <p class="mt-3">
-                    &emsp;&emsp;工具只是辅助，你的能力才是核心竞争力。
-                    愿它成为你求职路上的得力助手，助你斩获Offer！
+                    &emsp;&emsp;希望这个工具帮你省下重复操作的时间，去专注真正重要的事。求职如长跑，保持节奏比冲刺更关键。愿你方向清晰，步履从容，最终抵达的不仅是理想岗位，更是更坚定、更舒展的自己。
                 </p>
                 <p class="mt-2">
-                    &emsp;&emsp;冀以尘雾之微补益山海，荧烛末光增辉日月。
+                    &emsp;&emsp;祝前行有光，脚下有路。
                 </p>
             </div>
             <div style="text-align:right;color:${COLORS.textLight};text-indent:0;">
-                Zion Cai<br>
-                2025年6月于南昌
+                你的伙伴<br>
+                ZionCai<br>
+                2026年6月于西安
             </div>
         `;
  
