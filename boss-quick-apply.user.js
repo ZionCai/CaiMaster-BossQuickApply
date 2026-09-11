@@ -1,17 +1,30 @@
 // ==UserScript==
 // @name         菜大师boss海投助手
-// @namespace    https://github.com/zioncai/boss-master
-// @version      2.0.0
-// @description  菜大师BOSS直聘
+// @namespace    https://github.com/ZionCai/CaiMaster-BossQuickApply
+// @version      2.1.0
+// @description  BOSS直聘高效投递工具：AI智能招呼语 + 半自动投递 + 批量海投 + 简历导入
 // @author       Zion Cai
-// @match        https://www.zhipin.com/web/*
+// @match        https://www.zhipin.com/*
+// @match        https://zhipin.com/*
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @run-at       document-idle
 // @connect      zhipin.com
-// @connect      api.deepseek.com
+// @connect      *
 // @license      MIT
 // @noframes
+// @supportURL   https://github.com/ZionCai/CaiMaster-BossQuickApply/issues
 // ==/UserScript==
+
+/**
+ * v2.1.0 更新要点
+ * 1. 修复页面识别：兼容 /web/geek/job 与 /web/geek/jobs 两种职位页地址（旧版只认 /jobs，导致在 /job 页面上"什么都不做"）
+ * 2. 修复配置丢失：设置项全部纳入统一持久化，刷新后不再清空（旧版刷新后 API/简历/模板会被空值覆盖）
+ * 3. 修复面板/欢迎信不弹出：移除调试用 alert、增加注入重试与单页路由监听
+ * 4. 修复"只找不投递"：改为按 jobId 实时重查 DOM，多选择器兜底，并校验投递结果
+ * 5. 修复 AI 请求：systemRole 不再被覆盖，增加超时/重试/友好报错
+ */
  
 (function () {
   "use strict";
@@ -58,7 +71,7 @@
   const CONFIG = {
     BASIC_INTERVAL: 1000,
     OPERATION_INTERVAL: 1200,
- 
+
     DELAYS: {
       SHORT: 30,
       MEDIUM_SHORT: 200,
@@ -78,27 +91,73 @@
       SENT_RESUME_HRS: 300,
       SENT_IMAGE_RESUME_HRS: 300,
     },
- 
+
     API: {
-      TIMEOUT: 10000,
+      TIMEOUT: 20000,
       BASE_URL: 'https://leafboss.top/api',
       RETRY_COUNT: 3,
       RETRY_DELAY: 1000
     },
- 
+
     UI: {
       MINI_ICON_SIZE: 40,
       ANIMATION_DURATION: 300,
       DEBOUNCE_DELAY: 300
     },
- 
+
     PERFORMANCE: {
       DOM_CACHE_MAX_AGE: 5000,
       BATCH_SIZE: 10,
       CONCURRENT_LIMIT: 3
+    },
+
+    // 单次运行的安全上限，避免被风控
+    SAFETY: {
+      MAX_APPLY_PER_RUN: 50,
+      MAX_SCROLL_STEPS: 30,
+      APPLY_INTERVAL: 2500,
     }
   };
- 
+
+  /* =========================================================================
+   * 页面识别 —— v2.1.0 修复点
+   * 旧版全部使用 location.pathname.includes("/jobs") 判断，
+   * 但 BOSS 搜索结果页的实际地址是 /web/geek/job（无 s），
+   * 导致 Core.startProcessing 里两个分支都不命中：脚本"只是在找，不会投递"。
+   * ========================================================================= */
+  const PAGE = {
+    isChat() {
+      return location.pathname.indexOf("/chat") !== -1;
+    },
+    isGreetSettings() {
+      return location.pathname.indexOf("/notify-set") !== -1;
+    },
+    isJobDetail() {
+      return location.pathname.indexOf("/job_detail/") !== -1;
+    },
+    /** 职位列表页：/web/geek/job、/web/geek/jobs、/web/geek/recommend、/job_detail/xxx */
+    isJobList() {
+      const p = location.pathname;
+      if (PAGE.isChat() || PAGE.isGreetSettings()) return false;
+      return (
+        /\/web\/geek\/jobs?(\/|$)/.test(p) ||
+        /\/web\/geek\/recommend/.test(p) ||
+        /\/web\/geek\/job-list/.test(p) ||
+        PAGE.isJobDetail()
+      );
+    },
+    isSupported() {
+      return PAGE.isJobList() || PAGE.isChat() || PAGE.isGreetSettings();
+    },
+    /** 页面标识，用于单页路由切换时判断是否需要重建面板 */
+    key() {
+      if (PAGE.isChat()) return "chat";
+      if (PAGE.isGreetSettings()) return "greet-set";
+      if (PAGE.isJobList()) return "job-list";
+      return "other";
+    },
+  };
+
   const getStoredJSON = (key, defaultValue) => {
     try {
       const val = localStorage.getItem(key);
@@ -136,53 +195,39 @@
       useAiReply: true,
     },
  
-    settings: {
-      useAutoSendResume: getStoredJSON("useAutoSendResume", false),
-      aiGreetingEnabled: getStoredJSON("aiGreetingEnabled", true),
-      actionDelays: {
-        click: parseInt(localStorage.getItem("clickDelay") || "130"),
-      },
-      ai: {
-        role:
-          localStorage.getItem("aiRole") ||
-          "你是求职的应届生正在面对HR，回复需满足：20字内，编造专业对口/实习经验/证书任一岗位优势；被问个人信息或岗位条件，直接配合提供合理数据；全程积极真诚无拒绝言辞。",
-      },
-      autoReply: getStoredJSON("autoReply", false),
-      useAutoSendImageResume: getStoredJSON("useAutoSendImageResume", false),
-      imageResumeData: localStorage.getItem("imageResumeData") || null,
-      communicationMode:
-        localStorage.getItem("communicationMode") || "new-only",
-      recruiterActivityStatus: getStoredJSON(
-        "recruiterActivityStatus",
-        ["不限"]
-      ),
-      excludeHeadhunters: getStoredJSON("excludeHeadhunters", false),
-      imageResumes: getStoredJSON("imageResumes", []),
-      greetingsList: getStoredJSON("greetingsList", [
-        { id: "1", content: "您好！我是Peter，北京大学信息管理与信息系统专业 2026 届本科生。我学习能力强、上手快，执行力高，非常希望加入贵团队长期稳定发展。" },
-        { id: "2", content: "技术上，我掌握 Linux 系统、容器与云服务基础，熟悉 Vue、SpringCloud、Redis、MySQL、MongoDB、PostgreSQL、Kotlin、Flutter 等技术栈，可熟练使用 Java/Python 完成全栈开发与数据库开发。" },
-        { id: "3", content: "个人 GitHub：https://github.com/YangShengzhou03 Docker 仓库：https://hub.docker.com/repository/docker/yangshengzhou/" },
-        { id: "4", content: "在校期间荣获国家奖学金、ACM 竞赛银牌、蓝桥杯 Python 组国家级一等奖，通过大学英语四六级，专业基础扎实，做事踏实高效。" }
-      ]),
+    // 注意：这里只是占位，脚本加载后会被 state.settings = settings 覆盖为唯一配置对象
+    settings: {},
+
+    // 运行统计（面板底部展示）
+    stats: {
+      greeted: 0,
+      resumed: 0,
+      skipped: 0,
+      failed: 0,
+      startTime: 0,
     },
- 
+
+    // 当前正在处理的职位标识，用于 AI 招呼语 → 一键投递 的衔接
+    currentJobKey: null,
+    currentJobTitle: "",
+
     activation: {
       isActivated: localStorage.getItem("activationStatus") === "true",
       activationCode: localStorage.getItem("activationCode") || "",
       cardKey: localStorage.getItem("cardKey") || "",
       activatedAt: localStorage.getItem("activationDate") || "",
     },
- 
+
     comments: {
       currentCompanyName: "",
       commentsList: [],
       isLoading: false,
       isCommentMode: false,
     },
- 
+
     securityIdCache: new Map(),
   };
- 
+
   const elements = {
     panel: null,
     controlBtn: null,
@@ -539,51 +584,52 @@
   class StatePersistence {
     static saveState() {
       try {
-        const stateMap = {
-          aiReplyCount: state.ai.replyCount,
-          lastAiDate: state.ai.lastAiDate,
- 
-          useAiReply: state.ai.useAiReply,
-          useAutoSendResume: state.settings.useAutoSendResume,
-          useAutoSendImageResume: state.settings.useAutoSendImageResume,
-          imageResumeData: state.settings.imageResumeData,
-          imageResumes: state.settings.imageResumes || [],
-          greetingsList: state.settings.greetingsList || [],
-          theme: state.ui.theme,
-          clickDelay: state.settings.actionDelays.click,
-          includeKeywords: state.includeKeywords,
-          locationKeywords: state.locationKeywords,
-        };
- 
-        Object.entries(stateMap).forEach(([key, value]) => {
-          StorageManager.setItem(key, value);
-        });
+        // AI 回复计数/日期单独存（每日清零逻辑依赖它们）
+        StorageManager.setItem("aiReplyCount", state.ai.replyCount);
+        StorageManager.setItem("lastAiDate", state.ai.lastAiDate);
+
+        // 其余配置统一由 SettingsStore 落盘，避免再出现"漏写某个键"
+        if (typeof settings !== "undefined" && settings) {
+          settings.includeKeywords = state.includeKeywords || [];
+          settings.locationKeywords = state.locationKeywords || [];
+          SettingsStore.save(settings);
+        }
       } catch (error) {
-        Core.log(`保存状态失败: ${error.message}`);
+        console.warn("[海投助手] 保存状态失败:", error);
       }
     }
- 
+
     static loadState() {
       try {
-        state.includeKeywords = StorageManager.getParsedItem(
-          "includeKeywords",
-          []
-        );
-        state.locationKeywords =
-          StorageManager.getParsedItem("locationKeywords") ||
-          StorageManager.getParsedItem("excludeKeywords", []);
- 
-        const imageResumes = StorageManager.getParsedItem("imageResumes", []);
-        if (Array.isArray(imageResumes))
-          state.settings.imageResumes = imageResumes;
- 
-        const greetingsList = StorageManager.getParsedItem("greetingsList", []);
-        if (Array.isArray(greetingsList))
-          state.settings.greetingsList = greetingsList;
- 
+        state.includeKeywords = StorageManager.getParsedItem("includeKeywords", []);
+        state.locationKeywords = StorageManager.getParsedItem("locationKeywords", []);
+        if (!Array.isArray(state.includeKeywords)) state.includeKeywords = [];
+        if (!Array.isArray(state.locationKeywords)) {
+          state.locationKeywords = StorageManager.getParsedItem(
+            "excludeKeywords",
+            []
+          );
+        }
+
+        // 从新配置层恢复，保证与设置弹窗展示的一致
+        if (typeof settings !== "undefined" && settings) {
+          if (Array.isArray(settings.includeKeywords)) {
+            state.includeKeywords = settings.includeKeywords;
+          }
+          if (Array.isArray(settings.locationKeywords)) {
+            state.locationKeywords = settings.locationKeywords;
+          }
+          if (Array.isArray(settings.imageResumes)) {
+            state.settings.imageResumes = settings.imageResumes;
+          }
+          if (Array.isArray(settings.greetingsList)) {
+            state.settings.greetingsList = settings.greetingsList;
+          }
+        }
+
         StorageManager.ensureStorageLimits();
       } catch (error) {
-        Core.log(`加载状态失败: ${error.message}`);
+        console.warn("[海投助手] 加载状态失败:", error);
       }
     }
   }
@@ -1064,23 +1110,104 @@
     currentPageType: null,
  
     init() {
-      this.currentPageType = location.pathname.includes("/chat")
+      this.currentPageType = PAGE.isChat()
         ? this.PAGE_TYPES.CHAT
         : this.PAGE_TYPES.JOB_LIST;
       this._applyTheme();
       this.createControlPanel();
       this.createMiniIcon();
- 
-      if (this.currentPageType === this.PAGE_TYPES.JOB_LIST && !state.isRunning) {
-        setTimeout(() => {
-          Core.loadAndDisplayComments();
-        }, 500);
+      this._restorePanelPosition();
+
+      // 旧版这里调用了一个并不存在的 Core.loadAndDisplayComments()，
+      // 每次进入职位页都会抛 TypeError。评论区功能已下线，这里直接移除。
+      this._bindJobCardClick();
+    },
+
+    /**
+     * v2.1.0：点击职位卡片 → 生成 AI 招呼语。
+     * 旧版只绑定一次 document 监听（重复 init 会叠加），且要求 settings.resume 有值，
+     * 而 resume 又被"保存设置"清空过，导致这个功能实际从不触发。
+     */
+    _bindJobCardClick() {
+      if (this._cardClickBound) return;
+      this._cardClickBound = true;
+
+      document.addEventListener(
+        "click",
+        function (e) {
+          try {
+            if (!settings.aiGreetingEnabled) return;
+            if (state.isRunning) return;
+
+            const target = e.target;
+            const card =
+              (target.closest && target.closest("li.job-card-box")) ||
+              (target.closest && target.closest(".job-card-wrapper")) ||
+              (target.closest && target.closest('.job-list-box li[data-jobid]'));
+            if (!card) return;
+            // 点击"立即沟通"等按钮时不触发 AI 生成，交给投递流程
+            if (target.closest && target.closest(".op-btn-chat, .btn-startchat"))
+              return;
+
+            const jobId = Core.getCardJobId(card);
+            if (!jobId) return;
+
+            // 记录当前选中的职位，供"一键投递"使用
+            state.currentJobKey = jobId;
+            const nameEl = card.querySelector(".job-name");
+            state.currentJobTitle = nameEl ? nameEl.textContent.trim() : "";
+
+            if (!settings.aiApiKey) {
+              Core.log("提示：尚未配置 AI API Key，可在设置中配置后生成个性化招呼语");
+              return;
+            }
+            if (!settings.resume || !settings.resume.trim()) {
+              Core.log("提示：尚未填写「个人简历」，AI 无法生成招呼语（设置 → AI 设置）");
+              return;
+            }
+
+            clearTimeout(UI._aiGenTimer);
+            UI._aiGenTimer = setTimeout(async function () {
+              try {
+                const info = Core.extractJobDetail();
+                if (info && info.title) {
+                  await Core.generateGreeting(info);
+                  const ps = document.getElementById("greeting-preview-section");
+                  if (ps) ps.style.display = "block";
+                }
+              } catch (err) {
+                console.error("[海投助手] 生成招呼语失败:", err);
+              }
+            }, 1200);
+          } catch (err) {
+            console.error("[海投助手] 卡片点击处理异常:", err);
+          }
+        },
+        true
+      );
+    },
+
+    /** 恢复面板上次的拖拽位置 */
+    _restorePanelPosition() {
+      try {
+        const pos = settings.panelPosition;
+        if (pos && elements.panel && typeof pos.left === "number") {
+          elements.panel.style.right = "auto";
+          elements.panel.style.top = pos.top + "px";
+          elements.panel.style.left = pos.left + "px";
+        }
+      } catch (e) {}
+    },
+
+    /** 旧版调用了未定义的 UI.notify，这里补上（对应"招呼语开关检测"提示） */
+    notify(message, type) {
+      if (typeof showNotification === "function") {
+        showNotification(message, type === "warning" ? "error" : type || "success");
+      } else {
+        console.log("[海投助手]", message);
       }
- 
-   
-      document.addEventListener("click",function(e){var card=e.target.closest("li.job-card-box");if(card&&settings.aiGreetingEnabled&&settings.ai.apiKey&&settings.resume&&!state.isRunning){setTimeout(async function(){var ji=Core.extractJobDetail();if(ji&&ji.title){await Core.generateGreeting(ji);var ps=document.getElementById("greeting-preview-section");if(ps)ps.style.display="block";}},1500);}});
- },
- 
+    },
+
     createControlPanel() {
       if (document.getElementById("boss-pro-panel")) {
         document.getElementById("boss-pro-panel").remove();
@@ -1096,6 +1223,14 @@
       elements.panel.append(header, controls, elements.log, footer);
       document.body.appendChild(elements.panel);
       this._makeDraggable(elements.panel);
+
+      // 面板挂到 document 之后，统一同步一次与模式相关的 UI
+      // （旧版在元素还游离在内存里时就调用，导致取不到节点、开关状态永远不刷新）
+      refreshPanelModeUI();
+      refreshStatsUI();
+      if (this.currentPageType === this.PAGE_TYPES.JOB_LIST) {
+        loadSettingsIntoUIFilters();
+      }
     },
  
     _applyTheme() {
@@ -1208,10 +1343,29 @@
             close: "最小化聊天面板",
           };
  
-            var settingsBtn=this._createIconButton("⚙",function(){try{showSettingsDialog();}catch(e){alert("BTN: "+e.message);}},buttonTitles.settings);
-      settingsBtn.onclick=function(){alert("onclick!");try{showSettingsDialog();}catch(e){alert("S: "+e.message);}};
-      var closeBtn=this._createIconButton("✕",function(){state.isMinimized=true;elements.panel.style.transform="translateY(160%)";elements.miniIcon.style.display="flex";},buttonTitles.close);
-      closeBtn.onclick=function(){alert("close clicked");state.isMinimized=true;elements.panel.style.transform="translateY(160%)";elements.miniIcon.style.display="flex";};
+      var settingsBtn = this._createIconButton(
+        "⚙",
+        function () {
+          try {
+            showSettingsDialog();
+          } catch (e) {
+            console.error("[海投助手] 打开设置失败:", e);
+            if (typeof showNotification === "function") {
+              showNotification("打开设置失败：" + e.message, "error");
+            }
+          }
+        },
+        buttonTitles.settings
+      );
+      var closeBtn = this._createIconButton(
+        "✕",
+        function () {
+          state.isMinimized = true;
+          elements.panel.style.transform = "translateY(160%)";
+          if (elements.miniIcon) elements.miniIcon.style.display = "flex";
+        },
+        buttonTitles.close
+      );
       buttonContainer.append(settingsBtn,closeBtn);
       header.append(title, buttonContainer);
       return header;
@@ -1389,20 +1543,41 @@
       filterRow.append(includeFilterCol, locationFilterCol);
  
       var aiRow=document.createElement("div");aiRow.style.cssText="display:flex;justify-content:space-between;align-items:center;padding:8px 0;margin-bottom:8px;";
-      aiRow.innerHTML='<span style="font-size:13px;font-weight:600;color:#1e293b;">🤖 AI智能招呼语</span>';
-      var aiSw=document.createElement("div");aiSw.id="ai-greeting-toggle";aiSw.style.cssText="position:relative;width:48px;height:26px;border-radius:13px;cursor:pointer;transition:background 0.3s;";
+      aiRow.innerHTML='<div style="display:flex;flex-direction:column;gap:2px;"><span style="font-size:13px;font-weight:600;color:#1e293b;">🤖 AI智能招呼语</span><span id="ai-greeting-mode-hint" style="font-size:11px;color:#4F46E5;">半自动：AI 生成招呼语，确认后投递</span></div>';
+      var aiSw=document.createElement("div");aiSw.id="ai-greeting-toggle";aiSw.title="开启：半自动（AI生成招呼语，确认后投递）｜关闭：全自动批量海投";aiSw.style.cssText="position:relative;width:48px;height:26px;border-radius:13px;cursor:pointer;transition:background 0.3s;";
       var aiTh=document.createElement("div");aiTh.id="ai-greeting-thumb";aiTh.style.cssText="position:absolute;top:3px;width:20px;height:20px;border-radius:50%;background:white;box-shadow:0 1px 3px rgba(0,0,0,0.2);transition:left 0.3s;";
       aiSw.appendChild(aiTh);aiRow.appendChild(aiSw);
-      function upAI(){var o=settings.aiGreetingEnabled;aiSw.style.background=o?"#4F46E5":"#cbd5e1";aiTh.style.left=o?"25px":"3px";var p=document.getElementById("greeting-preview-section");if(p)p.style.display=o?"block":"none";}
-      setTimeout(upAI,0);
-      aiSw.addEventListener("click",function(){settings.aiGreetingEnabled=!settings.aiGreetingEnabled;saveSettings();upAI();state.settings.aiGreetingEnabled=settings.aiGreetingEnabled;Core.log(settings.aiGreetingEnabled?"AI已开启-半自动":"AI已关闭-全自动");});
+      // 注意：此处 aiSw 还没挂到 document 上，不能靠 getElementById 取，
+      // 必须直接用局部变量同步视觉状态（旧版就是因为这个原因，开关永远是灰的）
+      (function applyLocalState(){
+        var on=!!settings.aiGreetingEnabled;
+        aiSw.style.background=on?"#4F46E5":"#cbd5e1";
+        aiTh.style.left=on?"25px":"3px";
+      })();
+      aiSw.addEventListener("click",function(){
+        settings.aiGreetingEnabled=!settings.aiGreetingEnabled;
+        saveSettings();
+        refreshPanelModeUI(true);
+        Core.log(settings.aiGreetingEnabled?"已切换为 AI 半自动模式：点击职位卡片生成招呼语":"已切换为全自动模式：点「启动海投」批量沟通");
+      });
       filterContainer.appendChild(aiRow);
       var gp=document.createElement("div");gp.id="greeting-preview-section";gp.style.cssText="background:var(--secondary-color);border-radius:12px;padding:12px;margin-bottom:12px;";
       gp.innerHTML='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><span style="font-weight:600;font-size:13px;color:#333;">📝 AI招呼语预览 (可编辑)</span><button id="regen-greeting-btn" style="padding:4px 10px;background:var(--primary-color);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:11px;">重新生成</button></div>';
-      var gta=document.createElement("textarea");gta.id="greeting-preview-text";gta.rows=5;gta.placeholder="点击职位后AI自动生成个性化招呼语...";
+      var gta=document.createElement("textarea");gta.id="greeting-preview-text";gta.rows=5;gta.placeholder="点击左侧职位卡片后，AI 会自动生成针对性招呼语…";
       gta.style.cssText="width:100%;padding:10px;border-radius:8px;border:1px solid #d1d5db;font-size:13px;resize:vertical;box-sizing:border-box;font-family:inherit;";
       gp.appendChild(gta);filterContainer.appendChild(gp);
-      setTimeout(function(){var rb=document.getElementById("regen-greeting-btn");if(rb)rb.addEventListener("click",async function(){var ji=Core.extractJobDetail();if(ji&&ji.title){await Core.generateGreeting(ji);}else{Core.log("请先点击职位卡片");}});},1000);
+      // 同样：预览区此刻还没挂载，直接先设一次显示状态
+      gp.style.display = settings.aiGreetingEnabled ? "block" : "none";
+      var rb=document.getElementById("regen-greeting-btn");
+      if(rb)rb.addEventListener("click",async function(){
+        var ji=Core.extractJobDetail?Core.extractJobDetail():null;
+        if(ji&&ji.title){await Core.generateGreeting(ji);}
+        else{
+          var card=Core.getSelectedCard&&Core.getSelectedCard();
+          if(card){var t=card.querySelector(".job-name");await Core.generateGreeting({title:(t&&t.textContent.trim())||"",description:""});}
+          else Core.log("请先点击一个职位卡片");
+        }
+      });
 
       elements.controlBtn = this._createTextButton(
         settings.aiGreetingEnabled?"🚀 一键投递":"▶ 启动海投",
@@ -1541,19 +1716,28 @@
         `;
  
       const statsContainer = document.createElement("div");
+      statsContainer.id = "boss-panel-stats";
       statsContainer.style.cssText = `
             display: flex;
             justify-content: space-around;
             margin-bottom: 15px;
+            gap: 6px;
         `;
- 
+
+      statsContainer.innerHTML = `
+        <div style="flex:1;text-align:center;"><div id="stat-greeted" style="font-size:16px;font-weight:600;color:#4F46E5;">0</div><div style="font-size:11px;color:#94a3b8;">已沟通</div></div>
+        <div style="flex:1;text-align:center;"><div id="stat-resumed" style="font-size:16px;font-weight:600;color:#4F46E5;">0</div><div style="font-size:11px;color:#94a3b8;">已发简历</div></div>
+        <div style="flex:1;text-align:center;"><div id="stat-skipped" style="font-size:16px;font-weight:600;color:#94a3b8;">0</div><div style="font-size:11px;color:#94a3b8;">已跳过</div></div>
+        <div style="flex:1;text-align:center;"><div id="stat-failed" style="font-size:16px;font-weight:600;color:#ef4444;">0</div><div style="font-size:11px;color:#94a3b8;">失败</div></div>
+      `;
+
       footer.append(
         statsContainer,
         document.createTextNode(`© ${new Date().getFullYear()} Zion Cai · All Rights Reserved`)
       );
       return footer;
     },
- 
+
     _createTextButton(text, bgColor, onClick) {
       const btn = document.createElement("button");
       btn.className = "boss-btn";
@@ -1643,12 +1827,25 @@
           isDragging = false;
           panel.style.transition = "all 0.3s ease";
           panel.style.zIndex = "2147483646";
+          // 记住面板位置，刷新后不再回到默认点
+          try {
+            settings.panelPosition = {
+              left: panel.offsetLeft,
+              top: panel.offsetTop,
+            };
+            debouncedSaveSettings();
+          } catch (e) {}
         }
       });
     },
  
     createMiniIcon() {
+      const oldMini = document.getElementById("boss-mini-icon");
+      if (oldMini) oldMini.remove();
+
       elements.miniIcon = document.createElement("div");
+      elements.miniIcon.id = "boss-mini-icon";
+      elements.miniIcon.title = "展开 BOSS 海投助手";
       elements.miniIcon.style.cssText = `
         width: ${CONFIG.MINI_ICON_SIZE || 48}px;
         height: ${CONFIG.MINI_ICON_SIZE || 48}px;
@@ -1705,82 +1902,315 @@
     },
   };
  
-  const settings = {
-    useAutoSendResume: JSON.parse(
-      localStorage.getItem("useAutoSendResume") || "false"
-    ),
-    actionDelays: {
-      click: parseInt(localStorage.getItem("clickDelay") || "130"),
-    },
-    ai: {
-      role:
-        localStorage.getItem("aiRole") ||
-        "你是求职的应届生正在面对HR，回复需满足：20字内，编造专业对口/实习经验/证书任一岗位优势；被问个人信息或岗位条件，直接配合提供合理数据；全程积极真诚无拒绝言辞。",
-    },
- 
-    autoReply: JSON.parse(localStorage.getItem("autoReply") || "false"),
- 
-    useAutoSendImageResume: JSON.parse(
-      localStorage.getItem("useAutoSendImageResume") || "false"
-    ),
-    imageResumeData: localStorage.getItem("imageResumeData") || null,
- 
-    communicationMode: localStorage.getItem("communicationMode") || "new-only",
- 
-    recruiterActivityStatus: JSON.parse(
-      localStorage.getItem("recruiterActivityStatus") || '["不限"]'
-    ),
- 
-    excludeHeadhunters: JSON.parse(
-      localStorage.getItem("excludeHeadhunters") || "false"
-    ),
+  /* =========================================================================
+   * 统一配置层 —— v2.1.0 修复点（对应反馈："网页刷新设置里面配置信息全消失了"）
+   *
+   * 旧版问题：
+   *   1) 存在两个互不同步的配置对象：state.settings 与全局 settings；
+   *   2) saveSettings() 只持久化了一部分键（遗漏 aiGreetingEnabled、
+   *      communicationMode、includeKeywords 等）；
+   *   3) 全局 settings 初始化时根本没有读取 aiApiUrl/aiApiKey/aiModel/
+   *      userResume/greetingTemplate，而 loadSettingsIntoUI 也没有回填这些输入框，
+   *      于是用户打开设置弹窗 → 看到空输入框 → 点"保存设置" → 用空值覆盖了
+   *      本地已保存的配置 → 刷新后配置全部消失。
+   *
+   * 现在：单一对象、单一键表、读全写全，并兼容旧键（excludeKeywords 等）。
+   * ========================================================================= */
+
+  const DEFAULT_AI_ROLE =
+    "你是求职的应届生正在面对HR，回复需满足：20字内，编造专业对口/实习经验/证书任一岗位优势；被问个人信息或岗位条件，直接配合提供合理数据；全程积极真诚无拒绝言辞。";
+
+  const SETTINGS_DEFAULTS = {
+    // —— 运行模式 ——
+    aiGreetingEnabled: true,        // AI 智能招呼语（半自动）；关闭 = 全自动海投
+    autoReply: false,               // 聊天页 AI 自动回复
+    useAutoSendResume: false,       // 自动发送附件简历
+    useAutoSendImageResume: false,  // 自动发送图片简历
+    excludeHeadhunters: false,      // 排除猎头
+    useApiApply: false,             // 尝试走站内接口投递（更快，但易随接口变动失效）
+
+    // —— 筛选 ——
+    includeKeywords: [],            // 职位名包含
+    locationKeywords: [],           // 工作地包含
+    recruiterActivityStatus: ["不限"],
+
+    // —— 聊天页 ——
+    communicationMode: "new-only",
+    communicationIncludeKeywords: "",
+
+    // —— 节奏与安全上限 ——
+    clickDelay: 130,
+    applyInterval: 2500,
+    maxApplyPerRun: 50,
+
+    // —— 界面 ——
+    theme: "light",
+    panelPosition: null,
+    letterShownVersion: "",
+
+    // —— AI ——
+    aiRole: DEFAULT_AI_ROLE,
+    aiApiUrl: "https://api.deepseek.com/v1/chat/completions",
+    aiApiKey: "",
+    aiModel: "deepseek-chat",
+    resume: "",
+    greetingTemplate: "",
+    greetingsList: [
+      { id: "1", content: "" },
+    ],
+
+    // —— 图片简历 ——
+    imageResumes: [],
+    imageResumeData: null,
   };
- 
-  function saveSettings() {
-    localStorage.setItem(
-      "useAutoSendResume",
-      settings.useAutoSendResume.toString()
-    );
-    localStorage.setItem("clickDelay", settings.actionDelays.click.toString());
-    localStorage.setItem("aiRole", settings.ai.role);
-    localStorage.setItem("aiApiUrl", settings.ai.apiUrl||"");
-    localStorage.setItem("aiApiKey", settings.ai.apiKey||"");
-    localStorage.setItem("aiModel", settings.ai.model||"deepseek-chat");
-    if(settings.resume!==undefined)localStorage.setItem("userResume",settings.resume);
-    if(settings.greetingTemplate!==undefined)localStorage.setItem("greetingTemplate",settings.greetingTemplate);
- 
-    localStorage.setItem("autoReply", settings.autoReply.toString());
- 
-    localStorage.setItem(
-      "useAutoSendImageResume",
-      settings.useAutoSendImageResume.toString()
-    );
- 
-    if (settings.imageResumes) {
-      localStorage.setItem(
-        "imageResumes",
-        JSON.stringify(settings.imageResumes)
+
+  const SettingsStore = {
+    /** 布尔值安全解析（兼容 "true" / true / "1"） */
+    readBool(key, def) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw === null || raw === "") return def;
+        if (raw === "true" || raw === "1") return true;
+        if (raw === "false" || raw === "0") return false;
+        return !!JSON.parse(raw);
+      } catch (e) {
+        return def;
+      }
+    },
+
+    readJSON(key, def) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw === null || raw === "") return def;
+        const v = JSON.parse(raw);
+        return v === null || v === undefined ? def : v;
+      } catch (e) {
+        return def;
+      }
+    },
+
+    readString(key, def) {
+      try {
+        const raw = localStorage.getItem(key);
+        return raw === null ? def : raw;
+      } catch (e) {
+        return def;
+      }
+    },
+
+    readNumber(key, def) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw === null || raw === "") return def;
+        const n = parseInt(raw, 10);
+        return isNaN(n) ? def : n;
+      } catch (e) {
+        return def;
+      }
+    },
+
+    /** 读取全部配置（含旧键迁移） */
+    load() {
+      const D = SETTINGS_DEFAULTS;
+
+      // 旧键迁移：excludeKeywords -> locationKeywords
+      let locationKeywords = this.readJSON("locationKeywords", null);
+      if (!Array.isArray(locationKeywords)) {
+        locationKeywords = this.readJSON("excludeKeywords", D.locationKeywords);
+      }
+      if (!Array.isArray(locationKeywords)) locationKeywords = [];
+
+      let greetingsList = this.readJSON("greetingsList", null);
+      if (!Array.isArray(greetingsList) || greetingsList.length === 0) {
+        greetingsList = JSON.parse(JSON.stringify(D.greetingsList));
+      }
+      greetingsList = greetingsList
+        .filter((g) => g && typeof g === "object")
+        .map((g, i) => ({
+          id: String(g.id || i + 1),
+          content: typeof g.content === "string" ? g.content : "",
+        }));
+
+      let imageResumes = this.readJSON("imageResumes", []);
+      if (!Array.isArray(imageResumes)) imageResumes = [];
+
+      let activityStatus = this.readJSON(
+        "recruiterActivityStatus",
+        D.recruiterActivityStatus
       );
-    }
- 
-    if (settings.imageResumeData) {
-      localStorage.setItem("imageResumeData", settings.imageResumeData);
-    } else {
-      localStorage.removeItem("imageResumeData");
-    }
- 
-    localStorage.setItem(
-      "recruiterActivityStatus",
-      JSON.stringify(settings.recruiterActivityStatus)
-    );
- 
-    localStorage.setItem(
-      "excludeHeadhunters",
-      settings.excludeHeadhunters.toString()
-    );
- 
-    if (state.settings) {
-      Object.assign(state.settings, settings);
+      if (!Array.isArray(activityStatus) || activityStatus.length === 0) {
+        activityStatus = ["不限"];
+      }
+
+      return {
+        aiGreetingEnabled: this.readBool("aiGreetingEnabled", D.aiGreetingEnabled),
+        autoReply: this.readBool("autoReply", D.autoReply),
+        useAutoSendResume: this.readBool("useAutoSendResume", D.useAutoSendResume),
+        useAutoSendImageResume: this.readBool(
+          "useAutoSendImageResume",
+          D.useAutoSendImageResume
+        ),
+        excludeHeadhunters: this.readBool("excludeHeadhunters", D.excludeHeadhunters),
+        useApiApply: this.readBool("useApiApply", D.useApiApply),
+
+        includeKeywords: (() => {
+          const v = this.readJSON("includeKeywords", []);
+          return Array.isArray(v) ? v : [];
+        })(),
+        locationKeywords,
+        recruiterActivityStatus: activityStatus,
+
+        communicationMode: this.readString("communicationMode", D.communicationMode),
+        communicationIncludeKeywords: this.readString(
+          "communicationIncludeKeywords",
+          D.communicationIncludeKeywords
+        ),
+
+        clickDelay: this.readNumber("clickDelay", D.clickDelay),
+        applyInterval: this.readNumber("applyInterval", D.applyInterval),
+        maxApplyPerRun: this.readNumber("maxApplyPerRun", D.maxApplyPerRun),
+
+        theme: this.readString("theme", D.theme),
+        panelPosition: this.readJSON("panelPosition", null),
+        letterShownVersion: this.readString("letterShownVersion", ""),
+
+        aiRole: this.readString("aiRole", D.aiRole),
+        aiApiUrl: this.readString("aiApiUrl", D.aiApiUrl),
+        aiApiKey: this.readString("aiApiKey", D.aiApiKey),
+        aiModel: this.readString("aiModel", D.aiModel),
+        resume: this.readString("userResume", D.resume),
+        greetingTemplate: this.readString("greetingTemplate", D.greetingTemplate),
+        greetingsList,
+
+        imageResumes,
+        imageResumeData: this.readString("imageResumeData", null),
+      };
+    },
+
+    /** 写入全部配置 */
+    save(s) {
+      if (!s) return;
+      const write = (k, v) => {
+        try {
+          localStorage.setItem(k, v === null || v === undefined ? "" : String(v));
+        } catch (e) {
+          console.warn("[海投助手] 写入配置失败", k, e);
+        }
+      };
+      const writeJSON = (k, v) => {
+        try {
+          localStorage.setItem(k, JSON.stringify(v));
+        } catch (e) {
+          console.warn("[海投助手] 写入配置失败", k, e);
+        }
+      };
+
+      write("aiGreetingEnabled", s.aiGreetingEnabled);
+      write("autoReply", s.autoReply);
+      write("useAutoSendResume", s.useAutoSendResume);
+      write("useAutoSendImageResume", s.useAutoSendImageResume);
+      write("excludeHeadhunters", s.excludeHeadhunters);
+      write("useApiApply", s.useApiApply);
+
+      writeJSON("includeKeywords", s.includeKeywords || []);
+      writeJSON("locationKeywords", s.locationKeywords || []);
+      writeJSON("recruiterActivityStatus", s.recruiterActivityStatus || ["不限"]);
+
+      write("communicationMode", s.communicationMode);
+      write("communicationIncludeKeywords", s.communicationIncludeKeywords);
+
+      write("clickDelay", s.clickDelay);
+      write("applyInterval", s.applyInterval);
+      write("maxApplyPerRun", s.maxApplyPerRun);
+
+      write("theme", s.theme);
+      writeJSON("panelPosition", s.panelPosition);
+      write("letterShownVersion", s.letterShownVersion);
+
+      write("aiRole", s.aiRole);
+      write("aiApiUrl", s.aiApiUrl);
+      write("aiApiKey", s.aiApiKey);
+      write("aiModel", s.aiModel);
+      write("userResume", s.resume);
+      write("greetingTemplate", s.greetingTemplate);
+      writeJSON("greetingsList", s.greetingsList || []);
+
+      writeJSON("imageResumes", s.imageResumes || []);
+      if (s.imageResumeData) write("imageResumeData", s.imageResumeData);
+      else {
+        try {
+          localStorage.removeItem("imageResumeData");
+        } catch (e) {}
+      }
+    },
+  };
+
+  /** 唯一配置实例；state.settings 会指向同一个对象（见下方 state.settings = settings） */
+  const settings = SettingsStore.load();
+
+  // 兼容旧代码写法 settings.ai.role / settings.ai.apiKey / settings.actionDelays.click
+  Object.defineProperty(settings, "ai", {
+    enumerable: false,
+    configurable: true,
+    get() {
+      const self = settings;
+      return {
+        get role() {
+          return self.aiRole;
+        },
+        set role(v) {
+          self.aiRole = v;
+        },
+        get apiUrl() {
+          return self.aiApiUrl;
+        },
+        set apiUrl(v) {
+          self.aiApiUrl = v;
+        },
+        get apiKey() {
+          return self.aiApiKey;
+        },
+        set apiKey(v) {
+          self.aiApiKey = v;
+        },
+        get model() {
+          return self.aiModel;
+        },
+        set model(v) {
+          self.aiModel = v;
+        },
+      };
+    },
+  });
+
+  Object.defineProperty(settings, "actionDelays", {
+    enumerable: false,
+    configurable: true,
+    get() {
+      const self = settings;
+      return {
+        get click() {
+          return self.clickDelay;
+        },
+        set click(v) {
+          self.clickDelay = v;
+        },
+      };
+    },
+  });
+
+  // 关键：让 state.settings 与全局 settings 变成同一个对象，彻底消除"两份配置不同步"
+  state.settings = settings;
+
+  /** 兼容旧调用点：保存配置并同步到 state */
+  function saveSettings() {
+    try {
+      SettingsStore.save(settings);
+      if (state && state.settings) Object.assign(state.settings, settings);
+      return true;
+    } catch (error) {
+      console.error("[海投助手] 保存设置失败:", error);
+      return false;
     }
   }
  
@@ -1952,7 +2382,13 @@
  
     const aiSettingsPanel = document.createElement("div");
     aiSettingsPanel.id = "ai-settings-panel";
-var as=document.createElement("div");as.style.cssText="background:#f8fafc;border-radius:12px;padding:15px;margin-bottom:15px;border:1px solid #e2e8f0;";as.appendChild(Object.assign(document.createElement("h4"),{textContent:"AI API 配置",style:{margin:"0 0 12px",color:"#1e293b",fontSize:"15px",fontWeight:"600"}}));[{id:"ai-api-url-input",l:"API 地址",p:"https://api.deepseek.com/v1/chat/completions"},{id:"ai-api-key-input",l:"API Key",p:"sk-xxx",pw:!0},{id:"ai-model-input",l:"模型名称",p:"deepseek-chat"}].forEach(function(cf){as.appendChild(Object.assign(document.createElement("label"),{textContent:cf.l,style:{display:"block",marginBottom:"4px",fontSize:"12px",color:"#64748b"}}));var ip=Object.assign(document.createElement("input"),{type:cf.pw?"password":"text",id:cf.id,placeholder:cf.p});ip.style.cssText="width:100%;padding:8px 10px;border-radius:6px;border:1px solid #d1d5db;font-size:13px;margin-bottom:10px;box-sizing:border-box;";as.appendChild(ip);});var aw=Object.assign(document.createElement("div"),{textContent:"Key存储在本地，请勿在公用电脑使用",style:{fontSize:"11px",color:"#f59e0b",marginBottom:"10px"}});as.appendChild(aw);var ab=document.createElement("button");ab.textContent="保存API配置";ab.style.cssText="width:100%;padding:8px;background:#4F46E5;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;margin-top:4px;";ab.addEventListener("click",function(){var a=document.getElementById("ai-api-url-input");if(a)settings.ai.apiUrl=a.value;var b=document.getElementById("ai-api-key-input");if(b)settings.ai.apiKey=b.value;var c=document.getElementById("ai-model-input");if(c)settings.ai.model=c.value||"deepseek-chat";saveSettings();alert("API已保存");});as.appendChild(ab);aiSettingsPanel.appendChild(as);
+var as=document.createElement("div");as.style.cssText="background:#f8fafc;border-radius:12px;padding:15px;margin-bottom:15px;border:1px solid #e2e8f0;";as.appendChild(Object.assign(document.createElement("h4"),{textContent:"AI API 配置",style:{margin:"0 0 12px",color:"#1e293b",fontSize:"15px",fontWeight:"600"}}));[{id:"ai-api-url-input",l:"API 地址",p:"https://api.deepseek.com/v1/chat/completions"},{id:"ai-api-key-input",l:"API Key",p:"sk-xxx",pw:!0},{id:"ai-model-input",l:"模型名称",p:"deepseek-chat"}].forEach(function(cf){as.appendChild(Object.assign(document.createElement("label"),{textContent:cf.l,style:{display:"block",marginBottom:"4px",fontSize:"12px",color:"#64748b"}}));var ip=Object.assign(document.createElement("input"),{type:cf.pw?"password":"text",id:cf.id,placeholder:cf.p});ip.style.cssText="width:100%;padding:8px 10px;border-radius:6px;border:1px solid #d1d5db;font-size:13px;margin-bottom:10px;box-sizing:border-box;";as.appendChild(ip);});var aw=Object.assign(document.createElement("div"),{textContent:"Key存储在本地，请勿在公用电脑使用",style:{fontSize:"11px",color:"#f59e0b",marginBottom:"10px"}});as.appendChild(aw);var btnRow=document.createElement("div");btnRow.style.cssText="display:flex;gap:8px;margin-top:4px;";
+var ab=document.createElement("button");ab.textContent="保存API配置";ab.style.cssText="flex:1;padding:8px;background:#4F46E5;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;";
+function collectApi(){var a=document.getElementById("ai-api-url-input");if(a)settings.aiApiUrl=a.value.trim();var b=document.getElementById("ai-api-key-input");if(b)settings.aiApiKey=b.value.trim();var c=document.getElementById("ai-model-input");if(c)settings.aiModel=c.value.trim()||"deepseek-chat";}
+ab.addEventListener("click",function(){collectApi();saveSettings();showNotification("API 配置已保存");});
+var tb=document.createElement("button");tb.textContent="测试连接";tb.style.cssText="flex:1;padding:8px;background:#fff;color:#4F46E5;border:1px solid #4F46E5;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500;";
+tb.addEventListener("click",async function(){collectApi();saveSettings();if(!settings.aiApiKey){showNotification("请先填写 API Key","error");return;}tb.disabled=true;tb.textContent="测试中...";try{var r=await Core.requestAi("你好，请只回复两个字：可用",null,{retries:0});showNotification(r?"连接成功："+String(r).slice(0,20):"连接失败，请检查配置","success");}catch(e){showNotification("连接失败："+e.message,"error");}finally{tb.disabled=false;tb.textContent="测试连接";}});
+btnRow.appendChild(ab);btnRow.appendChild(tb);as.appendChild(btnRow);aiSettingsPanel.appendChild(as);
 
  
     const roleSettingResult = createSettingItem(
@@ -2039,27 +2475,47 @@ var as=document.createElement("div");as.style.cssText="background:#f8fafc;border
     greetingsSetting.append(greetingsContainer);
     
 var rr=createSettingItem("个人简历","输入教育背景、技能栈等，AI据此生成个性化招呼语",function(){return document.getElementById("user-resume-input");});var rs=rr.settingItem;var ri=document.createElement("textarea");ri.id="user-resume-input";ri.rows=5;ri.placeholder="我叫Zion Cai，3年前端经验...";ri.style.cssText="width:100%;padding:12px;border-radius:8px;border:1px solid #d1d5db;resize:vertical;font-size:14px;margin-top:10px;box-sizing:border-box;";rs.appendChild(ri);aiSettingsPanel.appendChild(rs);var tr=createSettingItem("招呼语模板","使用 {resume} {job_title} {job_requirements} 占位符",function(){return document.getElementById("greeting-template-input");});var ts=tr.settingItem;var ti=document.createElement("textarea");ti.id="greeting-template-input";ti.rows=6;ti.placeholder="根据以下信息生成3-5条简短的打招呼消息...";ti.style.cssText="width:100%;padding:12px;border-radius:8px;border:1px solid #d1d5db;resize:vertical;font-size:14px;margin-top:10px;box-sizing:border-box;";ts.appendChild(ti);aiSettingsPanel.appendChild(ts);
-var ir=createSettingItem("📤 导入简历 (Word/PDF/TXT)","支持 .docx .pdf .txt",function(){return document.getElementById("resume-file-input");});
+var ir=createSettingItem("📤 导入简历 (Word / PDF / TXT)","支持 .docx .pdf .txt / .md，最大 5MB，自动识别并填入上方文本框",function(){return document.getElementById("resume-file-input");});
 var ist=ir.settingItem;
 var iz=document.createElement("div");iz.style.cssText="border:2px dashed #cbd5e1;border-radius:10px;padding:16px;text-align:center;cursor:pointer;margin-top:8px;";
-iz.innerHTML='<div style="font-size:28px;">📂</div><div style="font-size:13px;color:#64748b;">点击上传简历文件</div><div style="font-size:11px;color:#94a3b8;">.docx .pdf .txt 最大5MB</div>';
-var fi=document.createElement("input");fi.type="file";fi.id="resume-file-input";fi.accept=".docx,.pdf,.txt";fi.style.display="none";
+iz.innerHTML='<div style="font-size:28px;">📂</div><div style="font-size:13px;color:#64748b;">点击上传简历文件</div><div style="font-size:11px;color:#94a3b8;">.docx .pdf .txt .md 最大 5MB</div>';
+var fi=document.createElement("input");fi.type="file";fi.id="resume-file-input";fi.accept=".docx,.doc,.pdf,.txt,.md";fi.style.display="none";
 var pd=document.createElement("div");pd.id="parsed-resume-result";pd.style.cssText="display:none;background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:10px 12px;margin-top:10px;font-size:12px;color:#166534;";
 iz.addEventListener("click",function(){fi.click();});
 iz.addEventListener("dragover",function(e){e.preventDefault();iz.style.borderColor="#4F46E5";iz.style.background="#f5f3ff";});
 iz.addEventListener("dragleave",function(){iz.style.borderColor="#cbd5e1";iz.style.background="";});
 iz.addEventListener("drop",function(e){e.preventDefault();iz.style.borderColor="#cbd5e1";iz.style.background="";if(e.dataTransfer.files[0])prf(e.dataTransfer.files[0]);});
 fi.addEventListener("change",function(e){if(e.target.files[0])prf(e.target.files[0]);});
-function prf(file){if(file.size>5242880){alert("文件不能超过5MB");return;}
-var ext=file.name.split(".").pop().toLowerCase();var rdr=new FileReader();
-rdr.onload=function(e){var t="";
-if(ext==="txt"){t=e.target.result;}
-else if(ext==="docx"){try{var arr=new Uint8Array(e.target.result);var raw=new TextDecoder("utf-8").decode(arr);
-var parts=raw.split("<w:t>");var txtParts=[];for(var i=1;i<parts.length;i++){var end=parts[i].indexOf("<");if(end>0)txtParts.push(parts[i].substring(0,end));}
-t=txtParts.join("");if(!t)t="无法解析";}catch(err){t="解析失败: "+err.message;}}
-else if(ext==="pdf"){t="PDF需额外库支持，建议另存为.txt后导入";}
-if(t&&t.trim()){var ru=document.getElementById("user-resume-input");if(ru)ru.value=t.trim();pd.style.display="block";pd.innerHTML="<strong>✅ 已识别: "+file.name+"</strong>";iz.style.borderColor="#86efac";iz.style.background="#f0fdf4";}else{alert("未识别出文本内容");}};
-ext==="docx"?rdr.readAsArrayBuffer(file):rdr.readAsText(file);}
+async function prf(file){
+  if(file.size>5242880){showNotification("文件不能超过 5MB","error");return;}
+  var ext=(file.name.split(".").pop()||"").toLowerCase();
+  try{
+    var t="";
+    if(ext==="txt"||ext==="md"){ t=await file.text(); }
+    else if(ext==="docx"){ t=await extractTextFromDocx(await file.arrayBuffer()); }
+    else if(ext==="doc"){
+      showNotification("旧版 .doc 无法直接解析，请另存为 .docx 或 .txt","error");return;
+    }
+    else if(ext==="pdf"){ t=await extractTextFromPdf(await file.arrayBuffer()); }
+    else { showNotification("不支持的文件类型：."+ext,"error");return; }
+
+    t=(t||"").replace(/\n{3,}/g,"\n\n").trim();
+    if(t.length<10){ showNotification("未识别出有效文本，建议改用 .docx 或 .txt","error");return; }
+
+    var ru=document.getElementById("user-resume-input");
+    if(ru)ru.value=t;
+    settings.resume=t; saveSettings();
+    pd.style.display="block";
+    pd.innerHTML="<strong>✅ 已识别 "+file.name+"</strong><div style='margin-top:4px;color:#15803d;'>共 "+t.length+" 字，可在上方文本框中继续编辑</div>";
+    iz.style.borderColor="#86efac"; iz.style.background="#f0fdf4";
+    showNotification("简历已导入，记得点「保存设置」");
+  }catch(err){
+    console.error("[海投助手] 简历解析失败:",err);
+    showNotification("解析失败："+err.message,"error");
+  }finally{
+    fi.value="";
+  }
+}
 ist.appendChild(iz);ist.appendChild(fi);ist.appendChild(pd);aiSettingsPanel.appendChild(ist);
 
 aiSettingsPanel.append(greetingsSetting);
@@ -2315,44 +2771,32 @@ aiSettingsPanel.append(greetingsSetting);
     }
  
     addResumeBtn.addEventListener("click", () => {
-      if (state.settings.imageResumes.length >= 5) {
-        if (typeof showNotification !== "undefined") {
-          showNotification("免费版最多添加5个图片简历", "info");
-        } else {
-          alert("免费版最多添加5个图片简历");
-        }
+      if (state.settings.imageResumes.length >= 10) {
+        showNotification("最多添加 10 个图片简历", "error");
       } else {
         hiddenFileInput.click();
       }
     });
- 
+
     hiddenFileInput.addEventListener("change", (e) => {
       if (e.target.files && e.target.files[0]) {
         const file = e.target.files[0];
- 
+
         const fileName = file.name.toLowerCase();
         if (!fileName.endsWith('.jpg') && !fileName.endsWith('.jpeg')) {
-          if (typeof showNotification !== "undefined") {
-            showNotification("仅支持JPG格式的图片文件", "error");
-          } else {
-            alert("仅支持JPG格式的图片文件");
-          }
+          showNotification("仅支持 JPG/JPEG 格式的图片文件", "error");
           hiddenFileInput.value = "";
           return;
         }
- 
+
         const isDuplicate = state.settings.imageResumes.some(
           (resume) => resume.path === file.name
         );
         if (isDuplicate) {
-          if (typeof showNotification !== "undefined") {
-            showNotification("该文件名已存在", "error");
-          } else {
-            alert("该文件名已存在");
-          }
+          showNotification("该文件名已存在", "error");
           return;
         }
- 
+
         const reader = new FileReader();
         reader.onload = function (event) {
           const newResume = {
@@ -2576,10 +3020,9 @@ aiSettingsPanel.append(greetingsSetting);
  
     statusClear.addEventListener("click", (e) => {
       e.stopPropagation();
-      settings.recruiterActivityStatus = [];
-  var aui=document.getElementById("ai-api-url-input");if(aui)aui.value=settings.ai.apiUrl||"";var aki=document.getElementById("ai-api-key-input");if(aki)aki.value=settings.ai.apiKey||"";var ami=document.getElementById("ai-model-input");if(ami)ami.value=settings.ai.model||"deepseek-chat";
-var rui=document.getElementById("user-resume-input");if(rui)rui.value=settings.resume||"";var tui=document.getElementById("greeting-template-input");if(tui)tui.value=settings.greetingTemplate||"";
-    updateStatusOptions();
+      settings.recruiterActivityStatus = ["不限"];
+      saveSettings();
+      updateStatusOptions();
     });
  
     document.addEventListener("click", (e) => {
@@ -2613,6 +3056,41 @@ var rui=document.getElementById("user-resume-input");if(rui)rui.value=settings.r
  
     statusSelect.append(statusHeader, statusOptions);
     recruiterStatusSetting.append(statusSelect);
+
+    // —— v2.1.0 新增：投递节奏与安全上限 ——
+    const paceSettingResult = createSettingItem(
+      "投递节奏 (毫秒)",
+      "每投递一个岗位之间的间隔，建议 2000-5000，过小容易触发风控",
+      () => document.getElementById("apply-interval-input")
+    );
+    const paceSetting = paceSettingResult.settingItem;
+    const paceInput = document.createElement("input");
+    paceInput.id = "apply-interval-input";
+    paceInput.type = "number";
+    paceInput.min = "800";
+    paceInput.step = "100";
+    paceInput.value = settings.applyInterval;
+    paceInput.style.cssText =
+      "width:100%;padding:8px 10px;border-radius:6px;border:1px solid #d1d5db;font-size:13px;margin-top:10px;box-sizing:border-box;";
+    paceSetting.append(paceInput);
+
+    const limitSettingResult = createSettingItem(
+      "单次投递上限",
+      "一次运行最多投递多少个岗位，默认 50，避免投递过多",
+      () => document.getElementById("max-apply-input")
+    );
+    const limitSetting = limitSettingResult.settingItem;
+    const limitInput = document.createElement("input");
+    limitInput.id = "max-apply-input";
+    limitInput.type = "number";
+    limitInput.min = "1";
+    limitInput.step = "1";
+    limitInput.value = settings.maxApplyPerRun;
+    limitInput.style.cssText =
+      "width:100%;padding:8px 10px;border-radius:6px;border:1px solid #d1d5db;font-size:13px;margin-top:10px;box-sizing:border-box;";
+    limitSetting.append(limitInput);
+
+    advancedSettingsPanel.append(paceSetting, limitSetting);
  
     advancedSettingsPanel.append(
       autoReplySetting,
@@ -2649,23 +3127,60 @@ var rui=document.getElementById("user-resume-input");if(rui)rui.value=settings.r
       "rgba(0, 123, 255, 0.9)",
       () => {
         try {
-          const aiRoleInput = document.getElementById("ai-role-input");
-          settings.ai.role = aiRoleInput ? aiRoleInput.value : "";
-          var ru3=document.getElementById("user-resume-input");if(ru3)settings.resume=ru3.value;
-          var tu3=document.getElementById("greeting-template-input");if(tu3)settings.greetingTemplate=tu3.value;
+          // 收集所有输入框的值再统一落盘（v2.1.0：不再只保存一部分字段）
+          const val = (id) => {
+            const el = document.getElementById(id);
+            return el ? el.value : undefined;
+          };
 
-          var au3=document.getElementById("ai-api-url-input");if(au3)settings.ai.apiUrl=au3.value;
-          var ak3=document.getElementById("ai-api-key-input");if(ak3)settings.ai.apiKey=ak3.value;
-          var am3=document.getElementById("ai-model-input");if(am3)settings.ai.model=am3.value||"deepseek-chat";
+          const aiRole = val("ai-role-input");
+          if (aiRole !== undefined) settings.aiRole = aiRole;
 
- 
+          const apiUrl = val("ai-api-url-input");
+          if (apiUrl !== undefined) settings.aiApiUrl = apiUrl.trim();
+
+          const apiKey = val("ai-api-key-input");
+          if (apiKey !== undefined) settings.aiApiKey = apiKey.trim();
+
+          const model = val("ai-model-input");
+          if (model !== undefined) settings.aiModel = model.trim() || "deepseek-chat";
+
+          const resume = val("user-resume-input");
+          if (resume !== undefined) settings.resume = resume;
+
+          const template = val("greeting-template-input");
+          if (template !== undefined) settings.greetingTemplate = template;
+
+          const intervalEl = val("apply-interval-input");
+          if (intervalEl !== undefined && intervalEl !== "") {
+            const n = parseInt(intervalEl, 10);
+            if (!isNaN(n) && n >= 800) settings.applyInterval = n;
+          }
+          const maxEl = val("max-apply-input");
+          if (maxEl !== undefined && maxEl !== "") {
+            const n = parseInt(maxEl, 10);
+            if (!isNaN(n) && n > 0) settings.maxApplyPerRun = n;
+          }
+
+          // 职位筛选关键词（弹窗里也能改）
+          const incEl = document.getElementById("include-filter");
+          if (incEl) {
+            settings.includeKeywords = splitKeywords(incEl.value);
+            state.includeKeywords = settings.includeKeywords;
+          }
+          const locEl = document.getElementById("location-filter");
+          if (locEl) {
+            settings.locationKeywords = splitKeywords(locEl.value);
+            state.locationKeywords = settings.locationKeywords;
+          }
+
           saveSettings();
- 
+          refreshPanelModeUI();
           showNotification("设置已保存");
           dialog.style.display = "none";
         } catch (error) {
           showNotification("保存失败: " + error.message, "error");
-          console.error("保存设置失败:", error);
+          console.error("[海投助手] 保存设置失败:", error);
         }
       }
     );
@@ -2792,56 +3307,128 @@ var rui=document.getElementById("user-resume-input");if(rui)rui.value=settings.r
     return `${settings.recruiterActivityStatus[0]}、${settings.recruiterActivityStatus[1]}等${settings.recruiterActivityStatus.length}项`;
   }
  
+  /**
+   * 把配置回填到设置弹窗的各个控件。
+   * v2.1.0 修复点：旧版这里没有回填「API 地址 / API Key / 模型 / 个人简历 / 招呼语模板」，
+   * 用户打开弹窗看到空白输入框，点保存就把已保存的值覆盖成空 —— 表现为"刷新后配置全没了"。
+   */
   function loadSettingsIntoUI() {
+    // —— AI 角色 ——
     const aiRoleInput = document.getElementById("ai-role-input");
-    if (aiRoleInput) {
-      aiRoleInput.value = settings.ai.role;
-    }
- 
-    const autoReplyInput = document.querySelector(
-      "#toggle-auto-reply-mode input"
-    );
-    if (autoReplyInput) {
-      autoReplyInput.checked = settings.autoReply;
-    }
- 
-    const autoSendResumeInput = document.querySelector(
-      "#toggle-auto-send-resume input"
-    );
-    if (autoSendResumeInput) {
-      autoSendResumeInput.checked = settings.useAutoSendResume;
-    }
- 
-    const excludeHeadhuntersInput = document.querySelector(
-      "#toggle-exclude-headhunters input"
-    );
-    if (excludeHeadhuntersInput) {
-      excludeHeadhuntersInput.checked = settings.excludeHeadhunters;
-    }
- 
-    const autoSendImageResumeInput = document.querySelector(
-      "#toggle-auto-send-image-resume input"
-    );
-    if (autoSendImageResumeInput) {
-      autoSendImageResumeInput.checked =
-        settings.useAutoSendImageResume &&
+    if (aiRoleInput) aiRoleInput.value = settings.aiRole || "";
+
+    // —— API 配置（旧版缺失）——
+    const apiUrlInput = document.getElementById("ai-api-url-input");
+    if (apiUrlInput) apiUrlInput.value = settings.aiApiUrl || "";
+    const apiKeyInput = document.getElementById("ai-api-key-input");
+    if (apiKeyInput) apiKeyInput.value = settings.aiApiKey || "";
+    const modelInput = document.getElementById("ai-model-input");
+    if (modelInput) modelInput.value = settings.aiModel || "";
+
+    // —— 个人简历 / 招呼语模板（旧版缺失）——
+    const resumeInput = document.getElementById("user-resume-input");
+    if (resumeInput) resumeInput.value = settings.resume || "";
+    const templateInput = document.getElementById("greeting-template-input");
+    if (templateInput) templateInput.value = settings.greetingTemplate || "";
+
+    // —— 开关（同步 checked 与滑块视觉状态）——
+    syncToggle("auto-reply-mode", settings.autoReply);
+    syncToggle("auto-send-resume", settings.useAutoSendResume);
+    syncToggle("exclude-headhunters", settings.excludeHeadhunters);
+    syncToggle(
+      "auto-send-image-resume",
+      !!(settings.useAutoSendImageResume &&
         settings.imageResumes &&
-        settings.imageResumes.length > 0;
-    }
- 
+        settings.imageResumes.length > 0)
+    );
+
+    // —— 沟通页设置 ——
     const communicationModeSelector = document.querySelector(
       "#communication-mode-selector select"
     );
     if (communicationModeSelector) {
-      communicationModeSelector.value = settings.communicationMode;
+      communicationModeSelector.value = settings.communicationMode || "new-only";
     }
- 
+    const commInclude = document.querySelector("#communication-include");
+    if (commInclude) {
+      commInclude.value = settings.communicationIncludeKeywords || "";
+    }
     if (elements.communicationIncludeInput) {
       elements.communicationIncludeInput.value =
         settings.communicationIncludeKeywords || "";
     }
- 
+
+    // —— 职位筛选条件 ——
+    const includeInput = document.querySelector("#include-filter");
+    if (includeInput) {
+      includeInput.value = (state.includeKeywords ||
+        settings.includeKeywords ||
+        []
+      ).join("，");
+    }
+    const locationInput = document.querySelector("#location-filter");
+    if (locationInput) {
+      locationInput.value = (state.locationKeywords ||
+        settings.locationKeywords ||
+        []
+      ).join("，");
+    }
+    if (elements.includeInput) {
+      elements.includeInput.value = (state.includeKeywords || []).join("，");
+    }
+    if (elements.locationInput) {
+      elements.locationInput.value = (state.locationKeywords || []).join("，");
+    }
+
+    // —— 节奏 ——
+    const applyIntervalInput = document.getElementById("apply-interval-input");
+    if (applyIntervalInput) applyIntervalInput.value = settings.applyInterval;
+    const maxApplyInput = document.getElementById("max-apply-input");
+    if (maxApplyInput) maxApplyInput.value = settings.maxApplyPerRun;
+
+    // —— 自我介绍列表 ——
+    loadGreetings();
+
+    // —— 招聘者活跃状态 ——
     updateStatusOptions();
+
+    // —— 图片简历数量 ——
+    refreshImageResumeCount();
+  }
+
+  /** 同步开关的勾选状态与滑块位置 */
+  function syncToggle(id, checked) {
+    const input = document.getElementById("toggle-" + id);
+    if (!input) return;
+    input.checked = !!checked;
+    const container = input.closest(".toggle-switch");
+    if (!container) return;
+    const slider = container.querySelector(".toggle-slider");
+    container.style.backgroundColor = checked
+      ? "rgba(0, 123, 255, 0.9)"
+      : "#e5e7eb";
+    if (slider) slider.style.left = checked ? "27px" : "3px";
+  }
+
+  /** 刷新"已上传 N 个简历"文案 */
+  function refreshImageResumeCount() {
+    const display = document.getElementById("image-resume-filename");
+    if (!display) return;
+    const count =
+      (settings.imageResumes && settings.imageResumes.length) || 0;
+    display.textContent = count > 0 ? `已上传 ${count} 个简历` : "未选择文件";
+  }
+
+  /** 面板上的筛选输入框回填（上次填的筛选项不该每次重填） */
+  function loadSettingsIntoUIFilters() {
+    try {
+      if (elements.includeInput) {
+        elements.includeInput.value = (state.includeKeywords || []).join("，");
+      }
+      if (elements.locationInput) {
+        elements.locationInput.value = (state.locationKeywords || []).join("，");
+      }
+    } catch (e) {}
   }
  
   function createDialogHeader(title, dialogId = "boss-settings-dialog") {
@@ -3117,6 +3704,64 @@ var rui=document.getElementById("user-resume-input");if(rui)rui.value=settings.r
     panel.style.display = "block";
   }
  
+  /**
+   * v2.1.0：统一刷新面板上与"模式"相关的 UI（AI 开关、按钮文案、预览区显隐）。
+   * 旧版这个逻辑散落在匿名闭包里，导致 settings.aiGreetingEnabled 为 undefined 时
+   * 开关看起来是关的、按钮文案也对不上。
+   */
+  function refreshPanelModeUI() {
+    try {
+      const on = !!settings.aiGreetingEnabled;
+
+      const sw = document.getElementById("ai-greeting-toggle");
+      const th = document.getElementById("ai-greeting-thumb");
+      if (sw) sw.style.background = on ? "#4F46E5" : "#cbd5e1";
+      if (th) th.style.left = on ? "25px" : "3px";
+
+      const preview = document.getElementById("greeting-preview-section");
+      if (preview) preview.style.display = on ? "block" : "none";
+
+      if (elements.controlBtn && !state.isRunning) {
+        elements.controlBtn.textContent = on ? "🚀 一键投递" : "▶ 启动海投";
+        elements.controlBtn.style.background = "var(--primary-color)";
+      }
+
+      // 同步开关旁边的小字说明
+      const hint = document.getElementById("ai-greeting-mode-hint");
+      if (hint) {
+        hint.textContent = on
+          ? "半自动：AI 生成招呼语，确认后投递"
+          : "全自动：批量自动沟通";
+        hint.style.color = on ? "#4F46E5" : "#94a3b8";
+      }
+    } catch (e) {
+      console.error("[海投助手] 刷新模式 UI 失败:", e);
+    }
+  }
+
+  /** v2.1.0：刷新面板底部的运行统计 */
+  function refreshStatsUI() {
+    const map = {
+      "stat-greeted": state.stats.greeted,
+      "stat-resumed": state.stats.resumed,
+      "stat-skipped": state.stats.skipped,
+      "stat-failed": state.stats.failed,
+    };
+    Object.keys(map).forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = String(map[id]);
+    });
+  }
+
+  function resetStats() {
+    state.stats.greeted = 0;
+    state.stats.resumed = 0;
+    state.stats.skipped = 0;
+    state.stats.failed = 0;
+    state.stats.startTime = Date.now();
+    refreshStatsUI();
+  }
+
   function showNotification(message, type = "success") {
     const notification = document.createElement("div");
     const bgColor =
@@ -3238,199 +3883,680 @@ var rui=document.getElementById("user-resume-input");if(rui)rui.value=settings.r
       }
     },
  
+    /* =====================================================================
+     * v2.1.0 重写：投递主流程
+     *
+     * 旧版致命问题：
+     *   1) 用 location.pathname.includes("/jobs") 判断页面，而真实地址是
+     *      /web/geek/job（无 s） → while 循环里两个分支都不命中，
+     *      表现就是"脚本只是在找，不会投递"；
+     *   2) 把 li.job-card-box 的 DOM 节点缓存进 state.jobList，BOSS 在点击后会
+     *      重新渲染列表，缓存节点变成游离节点，后续 click() 全部无效；
+     *   3) 点完「立即沟通」后只点了"留在此页"，既不校验是否真的投递成功，
+     *      也不会发送 AI 生成的招呼语。
+     * ===================================================================== */
+
+    /** 取页面上的职位卡片（兼容两种 DOM 结构） */
+    getJobCards() {
+      let cards = Array.from(document.querySelectorAll("li.job-card-box"));
+      if (!cards.length) {
+        cards = Array.from(
+          document.querySelectorAll(".job-list-box .job-card-wrapper, ul.job-list-box > li")
+        );
+      }
+      return cards;
+    },
+
+    /** 取职位的稳定标识（优先 jobId，其次标题+公司） */
+    getCardJobId(card) {
+      if (!card) return null;
+      try {
+        if (card.dataset && (card.dataset.jobid || card.dataset.lid)) {
+          return card.dataset.jobid || card.dataset.lid;
+        }
+        const a =
+          card.querySelector('a[href*="/job_detail/"]') ||
+          (card.tagName === "A" ? card : null);
+        if (a) {
+          const href = a.getAttribute("href") || "";
+          const m = href.match(/job_detail\/([^.\/?#]+)\.html/);
+          if (m) return m[1];
+        }
+        const inner = card.querySelector("[data-jobid]");
+        if (inner && inner.dataset.jobid) return inner.dataset.jobid;
+
+        const t = card.querySelector(".job-name");
+        const c = card.querySelector(".company-name, .company-info .name");
+        if (t) {
+          return (
+            t.textContent.trim() + "|" + (c ? c.textContent.trim() : "")
+          ).slice(0, 120);
+        }
+      } catch (e) {}
+      return null;
+    },
+
+    /** 按标识重新查一次卡片，避免使用已被 React 替换掉的游离节点 */
+    findCardById(jobId) {
+      if (!jobId) return null;
+      const cards = this.getJobCards();
+      for (const c of cards) {
+        if (this.getCardJobId(c) === jobId) return c;
+      }
+      return null;
+    },
+
+    /** 当前被用户点选的职位卡片（AI 招呼语 → 一键投递 的衔接） */
+    getSelectedCard() {
+      if (state.currentJobKey) {
+        const byKey = this.findCardById(state.currentJobKey);
+        if (byKey) return byKey;
+      }
+      const active = document.querySelector(
+        "li.job-card-box.active, li.job-card-box.selected, .job-card-wrapper.active"
+      );
+      return active || this.getJobCards()[0] || null;
+    },
+
     async startProcessing() {
-      if (location.pathname.includes("/jobs")) await this.autoScrollJobList();
- 
-      while (state.isRunning) {
-        if (location.pathname.includes("/jobs")) await this.processJobList();
-        else if (location.pathname.includes("/chat"))
-          await this.handleChatPage();
-        await this.delay(CONFIG.BASIC_INTERVAL);
+      // —— 聊天页：监听并自动回复 ——
+      if (PAGE.isChat()) {
+        this.log("开始监听招聘者消息…");
+        while (state.isRunning) {
+          try {
+            await this.handleChatPage();
+          } catch (e) {
+            this.log(`聊天处理异常: ${e.message}`);
+          }
+          await this.delay(CONFIG.BASIC_INTERVAL);
+        }
+        return;
+      }
+
+      // —— 非职位页：给出明确提示而不是静默空转（旧版就是在这里什么都不做）——
+      if (!PAGE.isJobList()) {
+        this.log("当前页面不是职位列表，请打开 www.zhipin.com/web/geek/jobs 后重试");
+        if (state.isRunning) toggleProcess();
+        return;
+      }
+
+      resetStats();
+
+      // 1. 自动滚动加载全部岗位
+      await this.autoScrollJobList();
+      if (!state.isRunning) return;
+
+      // 2. 收集岗位（只存标识，不存 DOM 节点）并应用筛选条件
+      const allCards = this.getJobCards();
+      const cards = this.filterJobCards(allCards);
+      if (!cards.length) {
+        this.log(
+          allCards.length
+            ? `共 ${allCards.length} 个岗位，但没有符合筛选条件的（自定义筛选：${(state.includeKeywords || []).join("、") || "无"} / ${(state.locationKeywords || []).join("、") || "无"}）`
+            : "页面上没有找到职位卡片，请确认职位列表已加载完成（可先手动搜索一次）"
+        );
+        if (state.isRunning) toggleProcess();
+        return;
+      }
+      this.log(
+        `筛选后共 ${cards.length}/${allCards.length} 个职位，开始逐个沟通…`
+      );
+
+      const maxApply = settings.maxApplyPerRun || CONFIG.SAFETY.MAX_APPLY_PER_RUN;
+      const interval = Math.max(
+        800,
+        settings.applyInterval || CONFIG.SAFETY.APPLY_INTERVAL
+      );
+      const done = new Set();
+      let applied = 0;
+
+      for (let i = 0; i < cards.length; i++) {
+        if (!state.isRunning) break;
+        if (applied >= maxApply) {
+          this.log(`已达到单次投递上限 ${maxApply} 个，自动停止（可在设置中调整）`);
+          break;
+        }
+
+        state.currentIndex = i;
+        const jobId = this.getCardJobId(cards[i]);
+
+        if (jobId && done.has(jobId)) {
+          continue;
+        }
+        if (jobId) done.add(jobId);
+
+        try {
+          const ok = await this.processOneJob(cards[i], i, cards.length);
+          if (ok) applied++;
+        } catch (e) {
+          state.stats.failed++;
+          refreshStatsUI();
+          this.log(`处理第 ${i + 1} 个职位出错：${e.message}`);
+        }
+
+        await this.delay(interval);
+      }
+
+      if (state.isRunning) {
+        this.log(
+          `本次运行结束：成功沟通 ${applied} 个，跳过 ${state.stats.skipped} 个，失败 ${state.stats.failed} 个`
+        );
+        toggleProcess();
       }
     },
- 
+
+    /** 自动滚动加载岗位列表（旧版没有步数上限，页面持续增长时会无限递归） */
     async autoScrollJobList() {
       return new Promise((resolve) => {
-        const cardSelector = "li.job-card-box";
-        const maxHistory = 3;
         const waitTime = CONFIG.BASIC_INTERVAL;
-        let cardCountHistory = [];
-        let isStopped = false;
- 
+        const maxSteps = CONFIG.SAFETY.MAX_SCROLL_STEPS;
+        let history = [];
+        let step = 0;
+        let stopped = false;
+
+        this.stopAutoScroll = () => {
+          stopped = true;
+          resolve(null);
+        };
+
         const scrollStep = async () => {
-          if (isStopped) return;
- 
+          if (stopped || !state.isRunning) return resolve(null);
+          step++;
+
+          const cards = this.getJobCards();
+          history.push(cards.length);
+          if (history.length > 3) history.shift();
+
+          const stable =
+            history.length === 3 && new Set(history).size === 1;
+
+          if (stable || step >= maxSteps) {
+            this.log(
+              `岗位列表加载完成，共 ${cards.length} 个${step >= maxSteps ? "（已达滚动上限）" : ""}`
+            );
+            return resolve(cards);
+          }
+
           window.scrollTo({
             top: document.documentElement.scrollHeight,
             behavior: "smooth",
           });
           await this.delay(waitTime);
- 
-          const cards = document.querySelectorAll(cardSelector);
-          const currentCount = cards.length;
-          cardCountHistory.push(currentCount);
- 
-          if (cardCountHistory.length > maxHistory) cardCountHistory.shift();
- 
-          if (
-            cardCountHistory.length === maxHistory &&
-            new Set(cardCountHistory).size === 1
-          ) {
-            this.log("当前页面岗位加载完成，开始沟通");
-            resolve(cards);
-            return;
-          }
- 
           scrollStep();
         };
- 
+
         scrollStep();
- 
-        this.stopAutoScroll = () => {
-          isStopped = true;
-          resolve(null);
-        };
       });
     },
- 
-    async processJobList() {
-      const activeStatusFilter = settings.recruiterActivityStatus;
- 
-      if (!state.jobList || state.jobList.length === 0) {
-        const excludeHeadhunters = settings.excludeHeadhunters;
-        state.jobList = Array.from(
-          document.querySelectorAll("li.job-card-box")
-        ).filter((card) => {
-          const title =
-            card.querySelector(".job-name")?.textContent?.toLowerCase() || "";
- 
-          const addressText = (
-            card.querySelector(".job-address-desc")?.textContent ||
-            card.querySelector(".company-location")?.textContent ||
-            card.querySelector(".job-area")?.textContent ||
-            ""
-          )
-            .toLowerCase()
-            .trim();
-          const headhuntingElement = card.querySelector(".job-tag-icon");
-          const altText = headhuntingElement ? headhuntingElement.alt : "";
- 
-          const includeMatch =
-            state.includeKeywords.length === 0 ||
-            state.includeKeywords.some((kw) => kw && title.includes(kw.trim()));
- 
-          const locationMatch =
-            state.locationKeywords.length === 0 ||
-            state.locationKeywords.some(
-              (kw) => kw && addressText.includes(kw.trim())
-            );
- 
-          const excludeHeadhunterMatch =
-            !excludeHeadhunters || !altText.includes("猎头");
- 
-          return includeMatch && locationMatch && excludeHeadhunterMatch;
-        });
- 
-        if (!state.jobList.length) {
-          this.log("没有符合条件的职位");
-          toggleProcess();
-          return;
-        }
-      }
- 
-      if (state.currentIndex >= state.jobList.length) {
-        this.resetCycle();
-        state.jobList = [];
-        return;
-      }
- 
-      const currentCard = state.jobList[state.currentIndex];
-      currentCard.scrollIntoView({ behavior: "smooth", block: "center" });
-      currentCard.click();
- 
-      await this.delay(CONFIG.OPERATION_INTERVAL * 2);
- 
-      let activeTime = "未知";
-      const onlineTag = document.querySelector(".boss-online-tag");
-      if (onlineTag && onlineTag.textContent.trim() === "在线") {
-        activeTime = "在线";
-      } else {
-        const activeTimeElement = document.querySelector(".boss-active-time");
-        activeTime = activeTimeElement?.textContent?.trim() || "未知";
-      }
- 
-      const isActiveStatusMatch =
-        activeStatusFilter.includes("不限") ||
-        activeStatusFilter.includes(activeTime);
- 
-      if (!isActiveStatusMatch) {
-        this.log(`跳过: 招聘者状态 "${activeTime}"`);
-        state.currentIndex++;
-        return;
-      }
- 
-      const includeLog = state.includeKeywords.length
-        ? `职位名包含[${state.includeKeywords.join("、")}]`
-        : "职位名不限";
-      const locationLog = state.locationKeywords.length
-        ? `工作地包含[${state.locationKeywords.join("、")}]`
-        : "工作地不限";
-      this.log(
-        `正在沟通：${++state.currentIndex}/${state.jobList.length
-        }，${includeLog}，${locationLog}，招聘者"${activeTime}"`
-      );
- 
-      const chatBtn = document.querySelector("a.op-btn-chat");
-      if (chatBtn) {
-        const btnText = chatBtn.textContent.trim();
-        if (btnText === "立即沟通") {
-          let securityIdInfo = APIInterceptor.getCurrentSecurityId();
- 
-          if (!securityIdInfo) {
-            this.log('未捕获到securityId，尝试从链接提取');
-            const jobInfo = this.extractJobInfo(currentCard);
-            if (jobInfo && jobInfo.securityId) {
-              securityIdInfo = {
-                securityId: jobInfo.securityId,
-                lid: jobInfo.lid,
-                jobId: jobInfo.jobId
-              };
-            }
-          }
- 
-          if (securityIdInfo && securityIdInfo.securityId) {
-            try {
-              await this.sendFriendRequest(
-                securityIdInfo.jobId || '',
-                securityIdInfo.securityId,
-                securityIdInfo.lid || ''
-              );
- 
-              await this.delay(CONFIG.OPERATION_INTERVAL);
-            } catch (error) {
-              this.log(`发送请求失败: ${error.message}，回退到点击方式`);
-              chatBtn.click();
-              await this.handleGreetingModal();
-            }
-          } else {
-            this.log(`无法获取securityId，使用点击方式`);
-            chatBtn.click();
-            await this.handleGreetingModal();
-          }
-        }
+
+    /** 读取招聘者活跃状态 */
+    getRecruiterActiveTime() {
+      try {
+        const onlineTag = document.querySelector(".boss-online-tag");
+        if (onlineTag && onlineTag.textContent.trim() === "在线") return "在线";
+        const el =
+          document.querySelector(".boss-active-time") ||
+          document.querySelector(".job-detail-box .boss-active-time");
+        return (el && el.textContent.trim()) || "未知";
+      } catch (e) {
+        return "未知";
       }
     },
- 
+
+    /**
+     * 找到详情区的沟通按钮。
+     * v2.1.0 修复：旧版用 document.querySelector("a.op-btn-chat")，
+     * 而职位卡片的底部按钮也用同一个 class，于是永远取到的是"卡片上的按钮"，
+     * 点完之后按钮变成"继续沟通"，下一个职位又被判定为"已沟通过" → 表现为只找不投递。
+     * 因此这里必须优先在详情区里找。
+     */
+    findChatButton() {
+      const detailScopes = [
+        ".job-detail-op",
+        ".job-detail-box",
+        ".job-detail-section",
+        ".job-detail-container",
+        ".detail-content",
+        "#job-detail",
+      ];
+      const innerSelectors = [
+        "a.op-btn-chat",
+        ".op-btn-chat",
+        "a.btn-startchat",
+        ".btn-startchat",
+        "a[ka*='job-detail-chat']",
+        "a[href*='chat']",
+        ".btn.btn-primary",
+      ];
+
+      const isChatText = (el) => {
+        const text = (el.textContent || "").replace(/\s+/g, "");
+        return (
+          text.indexOf("沟通") !== -1 ||
+          text.indexOf("投递") !== -1 ||
+          text.indexOf("打招呼") !== -1
+        );
+      };
+
+      // 1) 优先在详情区里找
+      for (const scope of detailScopes) {
+        const root = document.querySelector(scope);
+        if (!root) continue;
+        for (const sel of innerSelectors) {
+          const els = root.querySelectorAll(sel);
+          for (const el of els) {
+            if (isChatText(el)) return el;
+          }
+        }
+      }
+
+      // 2) 兜底：排除职位卡片上的按钮
+      for (const sel of innerSelectors) {
+        const els = document.querySelectorAll(sel);
+        for (const el of els) {
+          if (!isChatText(el)) continue;
+          if (el.closest("li.job-card-box, .job-card-wrapper")) continue;
+          return el;
+        }
+      }
+
+      return null;
+    },
+
+    /** 按"职位名/工作地/是否猎头"筛选卡片（旧版逻辑保留，抽成独立方法便于复用） */
+    filterJobCards(cards) {
+      const includeKeywords = state.includeKeywords || [];
+      const locationKeywords = state.locationKeywords || [];
+      const excludeHeadhunters = !!settings.excludeHeadhunters;
+
+      return (cards || []).filter((card) => {
+        if (!card) return false;
+        const title = (
+          card.querySelector(".job-name")?.textContent || ""
+        ).toLowerCase();
+
+        const addressText = (
+          card.querySelector(".job-address-desc")?.textContent ||
+          card.querySelector(".company-location")?.textContent ||
+          card.querySelector(".job-area")?.textContent ||
+          ""
+        )
+          .toLowerCase()
+          .trim();
+
+        const includeMatch =
+          includeKeywords.length === 0 ||
+          includeKeywords.some((kw) => kw && title.includes(kw.trim()));
+
+        const locationMatch =
+          locationKeywords.length === 0 ||
+          locationKeywords.some((kw) => kw && addressText.includes(kw.trim()));
+
+        let excludeHeadhunterMatch = true;
+        if (excludeHeadhunters) {
+          const tagEl = card.querySelector(".job-tag-icon");
+          const altText = tagEl ? tagEl.alt || "" : "";
+          const cardText = card.textContent || "";
+          excludeHeadhunterMatch =
+            altText.indexOf("猎头") === -1 && cardText.indexOf("猎头") === -1;
+        }
+
+        return includeMatch && locationMatch && excludeHeadhunterMatch;
+      });
+    },
+
+    /**
+     * 找职位卡片自带的「立即沟通」按钮。
+     * 直接点卡片上的按钮比"先点卡片、再等详情区刷新"稳定得多，
+     * 也是真人最常用的操作路径。
+     */
+    getCardChatButton(card) {
+      if (!card) return null;
+      const selectors = [
+        ".job-card-footer a.op-btn-chat",
+        "a.op-btn-chat",
+        ".op-btn-chat",
+        ".btn-startchat",
+        ".job-card-footer .btn",
+        ".start-chat-btn",
+      ];
+      for (const sel of selectors) {
+        const el = card.querySelector(sel);
+        if (el) return el;
+      }
+      return null;
+    },
+
+    /** 按钮文案归一化 */
+    normalizeBtnText(text) {
+      return String(text || "")
+        .replace(/\s+/g, "")
+        .trim();
+    },
+
+    isAlreadyGreeted(text) {
+      const t = this.normalizeBtnText(text);
+      return (
+        t.indexOf("继续沟通") !== -1 ||
+        t.indexOf("继续聊") !== -1 ||
+        t.indexOf("已沟通") !== -1 ||
+        t.indexOf("已投递") !== -1
+      );
+    },
+
+    isGreetButton(text) {
+      const t = this.normalizeBtnText(text);
+      return t.indexOf("立即沟通") !== -1 || t === "沟通" || t.indexOf("打招呼") !== -1;
+    },
+
+    /** 处理单个职位：过滤 → 沟通 → 校验 */
+    async processOneJob(card, index, total) {
+      if (!card) return false;
+
+      const jobId = this.getCardJobId(card);
+      const titleEl = card.querySelector(".job-name");
+      const title = titleEl ? titleEl.textContent.trim() : "未知职位";
+      const label = `[${index + 1}/${total}] ${title}`;
+
+      // 节点可能已被 React 重新渲染替换，按标识重新查一次
+      let liveCard = jobId ? this.findCardById(jobId) : card;
+      if (!liveCard) liveCard = card;
+
+      // 1) 先看卡片自身的按钮状态
+      let cardBtn = this.getCardChatButton(liveCard);
+      let btnText = cardBtn ? cardBtn.textContent : "";
+
+      if (cardBtn && this.isAlreadyGreeted(btnText)) {
+        state.stats.skipped++;
+        refreshStatsUI();
+        this.log(`${label} 已沟通过，跳过`);
+        return false;
+      }
+
+      // 2) 卡片上没有沟通按钮时，才点开详情去找
+      if (!cardBtn || !this.isGreetButton(btnText)) {
+        liveCard.scrollIntoView({ behavior: "smooth", block: "center" });
+        await this.delay(300);
+        this.simulateClickSync(liveCard);
+
+        const detailBtn = await this.waitForElement(
+          () => this.findChatButton(),
+          CONFIG.OPERATION_INTERVAL * 3
+        );
+        if (detailBtn && !this.isAlreadyGreeted(detailBtn.textContent)) {
+          cardBtn = detailBtn;
+          btnText = detailBtn.textContent;
+        }
+      }
+
+      if (!cardBtn) {
+        state.stats.failed++;
+        refreshStatsUI();
+        this.log(`${label} 未找到「立即沟通」按钮，可能页面结构已变化`);
+        return false;
+      }
+
+      if (!this.isGreetButton(btnText)) {
+        state.stats.skipped++;
+        refreshStatsUI();
+        this.log(`${label} 按钮文案为「${this.normalizeBtnText(btnText)}」，跳过`);
+        return false;
+      }
+
+      // 3) 招聘者活跃状态过滤
+      const activeTime = this.getRecruiterActiveTime();
+      const filter = settings.recruiterActivityStatus || ["不限"];
+      if (!filter.includes("不限") && !filter.includes(activeTime)) {
+        state.stats.skipped++;
+        refreshStatsUI();
+        this.log(`${label} 跳过：招聘者状态「${activeTime}」不在筛选范围内`);
+        return false;
+      }
+
+      // 4) 执行沟通
+      const greeting = this.pickGreetingText(title);
+      const ok = await this.applyToJob(liveCard, cardBtn, label, greeting);
+
+      if (ok) {
+        state.stats.greeted++;
+        refreshStatsUI();
+        if (jobId) {
+          try {
+            StorageManager.addRecordWithLimit(
+              CONFIG.STORAGE_KEYS.PROCESSED_HRS,
+              jobId,
+              state.hrInteractions.processedHRs,
+              CONFIG.STORAGE_LIMITS.PROCESSED_HRS
+            );
+          } catch (e) {}
+        }
+      } else {
+        state.stats.failed++;
+        refreshStatsUI();
+      }
+      return ok;
+    },
+
+    /** 选取要发送的招呼语：AI 预览优先，其次自我介绍列表 */
+    pickGreetingText(jobTitle) {
+      try {
+        const preview = document.getElementById("greeting-preview-text");
+        const previewText = preview ? (preview.value || "").trim() : "";
+        if (settings.aiGreetingEnabled && previewText) {
+          return previewText;
+        }
+        const list = (state.settings.greetingsList || [])
+          .map((g) => (g.content || "").trim())
+          .filter(Boolean);
+        return list.join("\n");
+      } catch (e) {
+        return "";
+      }
+    },
+
+    /**
+     * 真正执行一次投递，并校验结果。
+     * 返回 true 表示这次沟通确实生效。
+     */
+    async applyToJob(card, chatBtn, label, greeting) {
+      const beforeText = (chatBtn.textContent || "").replace(/\s+/g, "");
+
+      // 优先尝试站内接口（可选，默认关闭：接口易变且风控风险更高）
+      if (settings.useApiApply) {
+        const info = this.extractJobInfo(card);
+        let sec = APIInterceptor.getCurrentSecurityId();
+        if (!sec && info && info.securityId) {
+          sec = { securityId: info.securityId, lid: info.lid, jobId: info.jobId };
+        }
+        if (sec && sec.securityId) {
+          try {
+            await this.sendFriendRequest(
+              sec.jobId || (info && info.jobId) || "",
+              sec.securityId,
+              sec.lid || ""
+            );
+            this.log(`${label} 已通过站内接口发起沟通`);
+            await this.trySendGreetingText(greeting, label);
+            return true;
+          } catch (e) {
+            this.log(`${label} 接口方式失败（${e.message}），回退到模拟点击`);
+          }
+        }
+      }
+
+      // 模拟点击
+      await this.simulateClick(chatBtn);
+
+      const result = await this.waitApplyResult(beforeText, chatBtn);
+
+      if (!result.ok) {
+        this.log(`${label} 沟通结果未知：没有检测到成功提示，也未看到按钮变化`);
+        return false;
+      }
+
+      // 如果能找到输入框，把招呼语真正发出去
+      await this.trySendGreetingText(greeting, label);
+
+      // 停留在此页，继续处理下一个岗位（点"去沟通"会跳走并中断批量）
+      await this.closeGreetingModal();
+      return true;
+    },
+
+    /** 等待投递结果：按钮文案变化 / 弹窗 / 出现聊天输入框 / toast 提示 */
+    async waitApplyResult(beforeText, clickedBtn, timeout = 8000) {
+      const start = Date.now();
+      const before = this.normalizeBtnText(beforeText);
+
+      while (Date.now() - start < timeout) {
+        // 1) 被点的按钮文案变化（立即沟通 → 继续沟通）
+        if (clickedBtn && clickedBtn.isConnected) {
+          const now = this.normalizeBtnText(clickedBtn.textContent);
+          if (now && now !== before) return { ok: true, reason: "button-changed" };
+        }
+
+        // 2) 出现打招呼弹窗
+        const modal = document.querySelector(
+          '.greet-boss-dialog, .dialog-container, .dialog-wrap, [class*="greet"][class*="dialog"]'
+        );
+        if (modal) return { ok: true, reason: "modal" };
+
+        // 3) 出现聊天输入框（说明已进入沟通）
+        if (
+          document.querySelector(
+            "#chat-input, .chat-input, .input-area textarea, .chat-input-box textarea"
+          )
+        ) {
+          return { ok: true, reason: "chat-opened" };
+        }
+
+        // 4) 全局 toast 提示
+        const toast = document.querySelector(
+          ".toast, .message-tip, .ui-tip, [class*='toast']"
+        );
+        if (
+          toast &&
+          /成功|已发送|已投递|已沟通|打招呼|发送成功/.test(toast.textContent || "")
+        ) {
+          return { ok: true, reason: "toast" };
+        }
+
+        await this.delay(200);
+      }
+      return { ok: false };
+    },
+
+    /** 尝试把招呼语写进输入框并发送 */
+    async trySendGreetingText(greeting, label) {
+      if (!greeting || !greeting.trim()) return false;
+      try {
+        const findInput = () =>
+          document.querySelector(
+            "#chat-input, .chat-input, .greet-boss-dialog textarea, .dialog-container textarea, .input-area textarea, .chat-input-box textarea"
+          );
+
+        // 先同步查一次，没有再短暂等待，避免每个岗位都空等
+        let input = findInput();
+        if (!input) {
+          input = await this.waitForElement(findInput, CONFIG.OPERATION_INTERVAL);
+        }
+        if (!input) {
+          this.log(
+            `${label} 已发起沟通（BOSS 会使用「打招呼语设置」里的默认招呼语；想发送自定义招呼语请到 BOSS 设置页开启打招呼语）`
+          );
+          return false;
+        }
+
+        const messages = String(greeting)
+          .split(/\n+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+
+        for (const msg of messages) {
+          if (input.tagName === "TEXTAREA" || input.getAttribute("contenteditable")) {
+            input.focus();
+            if (input.value !== undefined) input.value = msg;
+            else input.textContent = msg;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+          } else {
+            input.focus();
+            document.execCommand("insertText", false, msg);
+          }
+          await this.delay(200);
+
+          const sendBtn =
+            document.querySelector(".btn-send") ||
+            document.querySelector(".send-btn");
+          if (sendBtn) {
+            await this.simulateClick(sendBtn);
+          } else if (input.dispatchEvent) {
+            input.dispatchEvent(
+              new KeyboardEvent("keydown", {
+                key: "Enter",
+                keyCode: 13,
+                which: 13,
+                bubbles: true,
+              })
+            );
+          }
+          await this.delay(600);
+        }
+
+        this.log(`${label} 已发送招呼语（${messages.length} 条）`);
+        return true;
+      } catch (e) {
+        this.log(`${label} 发送招呼语失败：${e.message}`);
+        return false;
+      }
+    },
+
+    /** 关闭打招呼弹窗并留在当前列表页 */
+    async closeGreetingModal() {
+      await this.delay(600);
+      try {
+        const candidates = Array.from(
+          document.querySelectorAll(
+            ".default-btn.cancel-btn, .dialog-container button, .greet-boss-dialog button, .dialog-wrap button"
+          )
+        );
+        const stay = candidates.find((b) => {
+          const t = (b.textContent || "").replace(/\s+/g, "");
+          return (
+            t === "留在此页" ||
+            t === "取消" ||
+            t === "稍后" ||
+            t === "关闭" ||
+            t === "知道了"
+          );
+        });
+        if (stay) {
+          await this.simulateClick(stay);
+          await this.delay(400);
+        }
+      } catch (e) {}
+    },
+
+    /** 兼容旧调用点 */
     async handleGreetingModal() {
-      await this.delay(CONFIG.OPERATION_INTERVAL * 4);
- 
-      const btn = [
-        ...document.querySelectorAll(".default-btn.cancel-btn"),
-      ].find((b) => b.textContent.trim() === "留在此页");
- 
-      if (btn) {
-        btn.click();
-        await this.delay(CONFIG.OPERATION_INTERVAL * 2);
+      await this.closeGreetingModal();
+    },
+
+    /** 同步版点击（用于点卡片，不必模拟完整鼠标序列） */
+    simulateClickSync(element) {
+      if (!element) return;
+      try {
+        element.dispatchEvent(
+          new MouseEvent("mousedown", { bubbles: true, cancelable: true })
+        );
+        element.dispatchEvent(
+          new MouseEvent("mouseup", { bubbles: true, cancelable: true })
+        );
+        element.dispatchEvent(
+          new MouseEvent("click", { bubbles: true, cancelable: true })
+        );
+      } catch (e) {
+        try {
+          element.click();
+        } catch (e2) {}
       }
     },
  
@@ -3637,8 +4763,113 @@ var rui=document.getElementById("user-resume-input");if(rui)rui.value=settings.r
       );
     },
  
-extractJobDetail(){try{var t=this.getPositionName()||"",d="",r="";var ss=[".job-detail-box .job-sec-text",".job-sec-text"];for(var i=0;i<ss.length;i++){var el=document.querySelector(ss[i]);if(el&&el.textContent.trim()){d=el.textContent.trim();break;}}var tags=document.querySelectorAll(".job-tag-box .tag-item,.job-tags .tag-item");if(tags.length>0)r=Array.from(tags).map(function(x){return x.textContent.trim()}).join("、");return{title:t,description:[d,r?"技能:"+r:""].filter(Boolean).join(String.fromCharCode(10))||t};}catch(e){return{title:this.getPositionName()||"",description:""};}},
-async generateGreeting(jobInfo){if(!settings.ai.apiKey){this.log("请先配置API Key");return"";}if(!settings.resume||!settings.resume.trim()){this.log("请填写个人简历");return"";}var gt="";if(state.settings.greetingsList&&state.settings.greetingsList.length>0){gt="自我介绍:"+String.fromCharCode(10)+state.settings.greetingsList.map(function(g){return g.content;}).filter(Boolean).join(String.fromCharCode(10))+String.fromCharCode(10)+String.fromCharCode(10);}var tpl=settings.greetingTemplate||"你是求职者，根据以下信息写3-5条给HR的打招呼消息。风格参考：您好，我是应届生，有相关实习经历，熟练使用相关工具，曾达成具体成果。对贵公司岗位很感兴趣，方便的话发简历给您。每条20-100字，口语化，用换行分开，只输出内容。"+String.fromCharCode(10)+String.fromCharCode(10)+"我的简历：{resume}"+String.fromCharCode(10)+"目标岗位：{job_title}"+String.fromCharCode(10)+"岗位要求：{job_requirements}";var p=tpl.replace(/{resume}/g,settings.resume).replace(/{job_title}/g,jobInfo.title).replace(/{job_requirements}/g,jobInfo.description);try{this.log("AI生成招呼语...");var txt=await this.requestAi(p,"你是求职者在BOSS直聘上给HR发第一条消息。参考示例风格：直接自我介绍，说明学历、经验、技能、成果，表达岗位意向，询问能否发简历。用语礼貌自然，像真人聊天，每条消息20-100字。发送3-5条消息，用换行分开。只输出打招呼内容，不要任何解释。");if(txt){state.currentGeneratedGreeting=txt;var pv=document.getElementById("greeting-preview-text");if(pv)pv.value=txt;this.log("生成成功");return txt;}}catch(e){this.log("失败:"+e.message);}return"";},
+    /** 抓取当前详情区的职位信息（标题 / 岗位要求 / 技能标签） */
+    extractJobDetail() {
+      try {
+        const title = this.getPositionName() || state.currentJobTitle || "";
+        let description = "";
+        const descSelectors = [
+          ".job-detail-box .job-sec-text",
+          ".job-detail-section .job-sec-text",
+          ".job-sec-text",
+          ".job-detail-box .text",
+        ];
+        for (const sel of descSelectors) {
+          const el = document.querySelector(sel);
+          if (el && el.textContent.trim()) {
+            description = el.textContent.trim();
+            break;
+          }
+        }
+        const tags = document.querySelectorAll(
+          ".job-tag-box .tag-item, .job-tags .tag-item, .job-keyword-list .tag-item"
+        );
+        const skills = tags.length
+          ? Array.from(tags)
+              .map((x) => x.textContent.trim())
+              .filter(Boolean)
+              .join("、")
+          : "";
+
+        return {
+          title: title,
+          description: [description, skills ? "技能：" + skills : ""]
+            .filter(Boolean)
+            .join("\n"),
+        };
+      } catch (e) {
+        return { title: this.getPositionName() || "", description: "" };
+      }
+    },
+
+    /**
+     * 生成 AI 招呼语。
+     * v2.1.0：提示词更明确，失败时给出可操作的原因；不再静默返回空串。
+     */
+    async generateGreeting(jobInfo) {
+      if (!settings.aiApiKey) {
+        this.log("请先在「设置 → AI 设置」中配置 API Key");
+        return "";
+      }
+      if (!settings.resume || !settings.resume.trim()) {
+        this.log("请先在「设置 → AI 设置」中填写「个人简历」，AI 才能生成针对性招呼语");
+        return "";
+      }
+      if (!jobInfo || !jobInfo.title) {
+        this.log("请先点击一个职位卡片，再生成招呼语");
+        return "";
+      }
+
+      let selfIntro = "";
+      const list = (state.settings.greetingsList || [])
+        .map((g) => (g.content || "").trim())
+        .filter(Boolean);
+      if (list.length) {
+        selfIntro = "自我介绍：\n" + list.join("\n") + "\n\n";
+      }
+
+      const defaultTpl =
+        "根据以下信息，写 3-5 条投递给 HR 的打招呼消息。\n" +
+        "要求：每条 20-100 字，口语化像真人聊天，突出与岗位匹配的技能/经历，表达对岗位的兴趣，最后询问是否方便发简历。\n" +
+        "只输出消息正文，用换行分隔，不要编号、不要任何解释。\n\n" +
+        "我的简历：{resume}\n" +
+        "目标岗位：{job_title}\n" +
+        "岗位要求：{job_requirements}";
+
+      const tpl = settings.greetingTemplate || defaultTpl;
+      const prompt = selfIntro +
+        tpl
+          .replace(/{resume}/g, settings.resume || "")
+          .replace(/{job_title}/g, jobInfo.title || "")
+          .replace(/{job_requirements}/g, jobInfo.description || "");
+
+      const systemRole =
+        "你是求职者在 BOSS 直聘上给 HR 发第一条消息。要求：先简洁自我介绍（学历/专业/年限），" +
+        "再说明与岗位匹配的技能与成果，表达岗位意向，最后询问能否发一份简历。" +
+        "语气礼貌自然、像真人聊天，不要客套废话，不要任何解释或前后缀。";
+
+      try {
+        this.log("正在调用 AI 生成招呼语…");
+        const txt = await this.requestAi(prompt, systemRole);
+        if (txt) {
+          state.currentGeneratedGreeting = txt;
+          const pv = document.getElementById("greeting-preview-text");
+          if (pv) pv.value = txt;
+          const ps = document.getElementById("greeting-preview-section");
+          if (ps) ps.style.display = "block";
+          this.log("招呼语生成成功，可编辑后点击「一键投递」");
+          return txt;
+        }
+        this.log("AI 返回内容为空，请检查模型配置");
+        return "";
+      } catch (e) {
+        this.log("AI 生成失败：" + e.message);
+        if (typeof showNotification === "function") {
+          showNotification("AI 生成失败：" + e.message, "error");
+        }
+        return "";
+      }
+    },
 updateGreetingPreview(text){var pv=document.getElementById("greeting-preview-text");if(pv)pv.value=text;},
     getPositionName() {
       try {
@@ -3727,55 +4958,139 @@ updateGreetingPreview(text){var pv=document.getElementById("greeting-preview-tex
       }
     },
  
-    async requestAi(message, systemRole) {
-      const authToken = settings.ai.apiKey || "";
-      const apiUrl = settings.ai.apiUrl || "https://api.deepseek.com/v1/chat/completions";
- 
+    /**
+     * 调用兼容 OpenAI 协议的对话接口。
+     * v2.1.0 修复：
+     *   - 旧版 system 提示词写成 localStorage.getItem("aiRole") || systemRole || ...，
+     *     导致传入的 systemRole 永远被覆盖，生成招呼语时用的是"聊天回复"的角色设定；
+     *   - 增加超时、失败重试与可读的错误信息（401/402/429 等）。
+     */
+    async requestAi(message, systemRole, options) {
+      const opts = options || {};
+      const retries = opts.retries === undefined ? 2 : opts.retries;
+      const authToken = settings.aiApiKey || "";
+      const apiUrl =
+        settings.aiApiUrl || "https://api.deepseek.com/v1/chat/completions";
+
+      if (!apiUrl) throw new Error("未配置 API 地址");
+
+      // 角色优先级：显式传入的 systemRole > AI 角色定位（设置里的"AI角色定位"）
+      const systemContent =
+        systemRole || settings.aiRole || "你是求职者，用口语化表达，言简意赅。";
+
       const requestBody = {
-        model: settings.ai.model || "deepseek-chat",
+        model: settings.aiModel || "deepseek-chat",
         messages: [
-          {
-            role: "system",
-            content:
-              localStorage.getItem("aiRole") ||
-              systemRole || localStorage.getItem("aiRole") || "你是求职者，用口语化表达，言简意赅。",
-          },
+          { role: "system", content: systemContent },
           { role: "user", content: message },
         ],
         temperature: 0.9,
         top_p: 0.8,
         max_tokens: 512,
+        stream: false,
       };
- 
+
+      let lastError = null;
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        if (attempt > 0) {
+          this.log(`AI 请求失败，${CONFIG.API.RETRY_DELAY}ms 后重试（${attempt}/${retries}）`);
+          await this.delay(CONFIG.API.RETRY_DELAY);
+        }
+        try {
+          const text = await this._doRequest(apiUrl, authToken, requestBody);
+          if (text) return text;
+        } catch (e) {
+          lastError = e;
+          // 鉴权/额度类错误重试无意义，直接抛出
+          if (/401|403|402|余额|额度|无效|Unauthorized/i.test(e.message)) break;
+        }
+      }
+      throw lastError || new Error("AI 请求失败");
+    },
+
+    _doRequest(apiUrl, authToken, requestBody) {
       return new Promise((resolve, reject) => {
+        const finish = (fn, arg) => {
+          try {
+            fn(arg);
+          } catch (e) {
+            console.error(e);
+          }
+        };
+
+        if (typeof GM_xmlhttpRequest !== "function") {
+          return reject(
+            new Error("当前脚本管理器未授予跨域请求权限（GM_xmlhttpRequest）")
+          );
+        }
+
         GM_xmlhttpRequest({
           method: "POST",
           url: apiUrl,
+          timeout: CONFIG.API.TIMEOUT,
           headers: {
             "Content-Type": "application/json",
-            Authorization: "Bearer " + (authToken||""),
+            Authorization: "Bearer " + (authToken || ""),
           },
           data: JSON.stringify(requestBody),
           onload: (response) => {
+            const status = response.status;
+            const body = response.responseText || "";
+
+            // 解析响应
+            let result = null;
             try {
-              const result = JSON.parse(response.responseText);
-              if (result.choices && result.choices[0] && result.choices[0].message) {
-                resolve(result.choices[0].message.content.trim());
-              } else if (result.code !== undefined) {
-                if (result.code !== 0) throw new Error("API错误: " + result.message + "（Code: " + result.code + "）");
-                resolve(result.choices[0].message.content.trim());
-              } else {
-                reject(new Error("未知API格式: " + response.responseText.substring(0,200)));
-              }
-            } catch (error) {
-              reject(new Error("解析失败: " + error.message));
+              result = JSON.parse(body);
+            } catch (e) {
+              return finish(
+                reject,
+                new Error(
+                  `接口返回了非 JSON 内容（HTTP ${status}）：${body.slice(0, 120)}`
+                )
+              );
             }
+
+            // 兼容 OpenAI 格式与部分中转站的 {code,message} 格式
+            const choice =
+              result &&
+              (result.choices && result.choices[0]) ||
+              (result.data && result.data.choices && result.data.choices[0]);
+
+            if (choice && choice.message && choice.message.content) {
+              return finish(resolve, String(choice.message.content).trim());
+            }
+
+            if (status < 200 || status >= 300) {
+              const msg =
+                (result && (result.error?.message || result.message)) ||
+                `HTTP ${status}`;
+              return finish(reject, new Error(msg));
+            }
+            if (result && result.code !== undefined && result.code !== 0) {
+              return finish(
+                reject,
+                new Error(
+                  `${result.message || "接口返回错误"}（code: ${result.code}）`
+                )
+              );
+            }
+
+            return finish(
+              reject,
+              new Error("无法识别的接口返回格式：" + body.slice(0, 160))
+            );
           },
-          onerror: (error) => reject(new Error("网络请求失败: " + JSON.stringify(error))),
+          onerror: () =>
+            finish(reject, new Error("网络请求失败，请检查 API 地址与网络")),
+          ontimeout: () =>
+            finish(
+              reject,
+              new Error(`请求超时（${CONFIG.API.TIMEOUT / 1000}s）`)
+            ),
         });
       });
     },
- 
+
     async getLastFriendMessageText() {
       try {
         const chatContainer = DOMCache.get(".chat-message .im-list");
@@ -3990,49 +5305,94 @@ updateGreetingPreview(text){var pv=document.getElementById("greeting-preview-tex
  
   function toggleProcess() {
     state.isRunning = !state.isRunning;
- 
+
     if (state.isRunning) {
       state.comments.isCommentMode = false;
       state.jobList = [];
- 
-      state.includeKeywords = elements.includeInput.value
-        .trim()
-        .toLowerCase()
-        .split(/[，,]/)
-        .filter((keyword) => keyword.trim() !== "");
-      state.locationKeywords = (elements.locationInput?.value || "")
-        .trim()
-        .toLowerCase()
-        .split(/[，,]/)
-        .filter((keyword) => keyword.trim() !== "");
- 
-      elements.controlBtn.textContent = "停止海投";
-      elements.controlBtn.style.background = "#4F46E5";
- 
-      const logPanel = document.querySelector("#pro-log");
-      if (logPanel) {
-        logPanel.innerHTML = "";
-      }
- 
-      const startTime = new Date();
-      Core.log(`开始自动海投，时间：${startTime.toLocaleTimeString()}`);
-      Core.log(
-        `筛选条件：职位名包含【${state.includeKeywords.join("、") || "无"
-        }】，工作地包含【${state.locationKeywords.join("、") || "无"}】`
+
+      // 读取面板上的筛选条件
+      state.includeKeywords = splitKeywords(
+        elements.includeInput ? elements.includeInput.value : ""
       );
- 
+      state.locationKeywords = splitKeywords(
+        elements.locationInput ? elements.locationInput.value : ""
+      );
+      settings.includeKeywords = state.includeKeywords;
+      settings.locationKeywords = state.locationKeywords;
+
+      // 保存筛选条件，下次打开不用重填（旧版刷新即丢）
+      debouncedSaveSettings();
+
+      if (elements.controlBtn) {
+        elements.controlBtn.textContent = "停止";
+        elements.controlBtn.style.background = "#ef4444";
+      }
+
+      const logPanel = document.querySelector("#pro-log");
+      if (logPanel) logPanel.innerHTML = "";
+
+      const startTime = new Date();
+      Core.log(`开始运行，时间：${startTime.toLocaleTimeString()}`);
+      Core.log(
+        `筛选条件：职位名包含【${state.includeKeywords.join("、") || "无"}】，工作地包含【${state.locationKeywords.join("、") || "无"}】`
+      );
+
+      // AI 半自动模式下，若已选中某个职位并生成过招呼语 → 只投递这一个
+      const preview = document.getElementById("greeting-preview-text");
+      const previewText = preview ? (preview.value || "").trim() : "";
+      const selectedCard = settings.aiGreetingEnabled
+        ? Core.getSelectedCard()
+        : null;
+
+      if (settings.aiGreetingEnabled && selectedCard && previewText) {
+        Core.log("AI 半自动模式：正在投递当前预览的职位…");
+        (async () => {
+          try {
+            const info = Core.extractJobDetail();
+            const title = (info && info.title) || state.currentJobTitle || "当前职位";
+            const btn = await Core.waitForElement(() => Core.findChatButton(), 6000);
+            if (!btn) {
+              Core.log(`未找到「立即沟通」按钮，请先点击职位卡片打开详情`);
+            } else {
+              const ok = await Core.applyToJob(selectedCard, btn, title, previewText);
+              if (ok) {
+                state.stats.greeted++;
+                refreshStatsUI();
+                Core.log(`已向「${title}」发起沟通`);
+              } else {
+                state.stats.failed++;
+                refreshStatsUI();
+                Core.log(`投递「${title}」未确认成功，请检查页面状态`);
+              }
+            }
+          } catch (e) {
+            Core.log(`投递出错：${e.message}`);
+          } finally {
+            state.isRunning = false;
+            if (elements.controlBtn) {
+              elements.controlBtn.textContent = "🚀 一键投递";
+              elements.controlBtn.style.background = "var(--primary-color)";
+            }
+          }
+        })();
+        return;
+      }
+
       Core.startProcessing();
     } else {
-      elements.controlBtn.textContent = "启动海投";
-      elements.controlBtn.style.background = "#4F46E5";
- 
+      if (elements.controlBtn) {
+        elements.controlBtn.textContent = settings.aiGreetingEnabled
+          ? "🚀 一键投递"
+          : "▶ 启动海投";
+        elements.controlBtn.style.background = "var(--primary-color)";
+      }
+
       state.isRunning = false;
       state.currentIndex = 0;
- 
-      if (location.pathname.includes("/jobs")) {
-        setTimeout(() => {
-          Core.loadAndDisplayComments();
-        }, 300);
+      if (typeof Core.stopAutoScroll === "function") {
+        try {
+          Core.stopAutoScroll();
+        } catch (e) {}
       }
     }
   }
@@ -4093,10 +5453,34 @@ updateGreetingPreview(text){var pv=document.getElementById("greeting-preview-tex
             display: flex;
             justify-content: center;
             align-items: center;
-            z-index: 9999;
+            z-index: 2147483647;
             backdrop-filter: blur(5px);
             animation: fadeIn 0.3s ease-out;
         `;
+
+      // v2.1.0：加一个关闭按钮，用户不想看信时可以直接关掉
+      const closeBtn = document.createElement("button");
+      closeBtn.textContent = "✕";
+      closeBtn.title = "关闭";
+      closeBtn.style.cssText = `
+            position: absolute;
+            top: 24px;
+            right: 28px;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: none;
+            background: rgba(255,255,255,0.2);
+            color: #fff;
+            font-size: 18px;
+            cursor: pointer;
+            z-index: 10;
+        `;
+      closeBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      });
+      overlay.appendChild(closeBtn);
  
       const envelopeContainer = document.createElement("div");
       envelopeContainer.id = "envelope-container";
@@ -4682,66 +6066,189 @@ updateGreetingPreview(text){var pv=document.getElementById("greeting-preview-tex
   function getToday() {
     return new Date().toISOString().split("T")[0];
   }
- 
-  async function init() {
+
+  /** v2.1.0：把中英文逗号分隔的筛选词切成数组 */
+  function splitKeywords(text) {
+    return String(text || "")
+      .trim()
+      .toLowerCase()
+      .split(/[，,]/)
+      .map((k) => k.trim())
+      .filter((k) => k !== "");
+  }
+
+  /** 今日零点自动清理 AI 回复计数（每天重新计数） */
+  function scheduleDailyAiReset() {
     try {
-      APIInterceptor.init();
- 
- 
       const midnight = new Date();
       midnight.setDate(midnight.getDate() + 1);
       midnight.setHours(0, 0, 0, 0);
+      const wait = midnight.getTime() - Date.now();
+      if (wait <= 0 || wait > 24 * 60 * 60 * 1000) return;
       setTimeout(() => {
-        localStorage.removeItem(STORAGE.AI_COUNT);
-        localStorage.removeItem(STORAGE.AI_DATE);
-        localStorage.removeItem(STORAGE.LETTER);
-      }, midnight - Date.now());
+        try {
+          localStorage.removeItem(STORAGE.AI_COUNT);
+          localStorage.removeItem(STORAGE.AI_DATE);
+        } catch (e) {}
+      }, wait);
+    } catch (e) {}
+  }
+
+  /** 等 document.body 可用，避免脚本注入过早导致面板挂不上 */
+  function waitForBody(timeout = 15000) {
+    return new Promise((resolve) => {
+      if (document.body) return resolve(true);
+      const start = Date.now();
+      const timer = setInterval(() => {
+        if (document.body) {
+          clearInterval(timer);
+          resolve(true);
+        } else if (Date.now() - start > timeout) {
+          clearInterval(timer);
+          resolve(false);
+        }
+      }, 50);
+    });
+  }
+
+  async function init() {
+    try {
+      // 配置加载 + 页面识别（旧版从未调用 loadState，导致筛选条件、存储上限都失效）
+      StatePersistence.loadState();
+      APIInterceptor.init();
+      scheduleDailyAiReset();
+
+      const ok = await waitForBody();
+      if (!ok || !document.body) {
+        console.warn("[海投助手] 页面结构不可用，放弃注入");
+        return;
+      }
+
       UI.init();
-      document.body.style.position = "relative";
+      try {
+        document.body.style.position = "relative";
+      } catch (e) {}
+
+      // 面板被 BOSS 的重新渲染顶掉时自动补挂
+      startPanelWatchdog();
+
       const today = getToday();
-      if (location.pathname.includes("/jobs")) {
-        if (localStorage.getItem(STORAGE.LETTER) !== today) {
+      if (PAGE.isJobList()) {
+        // 欢迎信只在首次安装（或版本升级）后出现一次，不再每天拦截用户
+        const shownVersion = settings.letterShownVersion || "";
+        if (shownVersion !== "2.1.0") {
           letter.showLetterToUser();
-          localStorage.setItem(STORAGE.LETTER, today);
+          settings.letterShownVersion = "2.1.0";
+          saveSettings();
         } else if (localStorage.getItem(STORAGE.GUIDE) !== "true") {
           guide.showGuideToUser();
           localStorage.setItem(STORAGE.GUIDE, "true");
         }
-        Core.log("欢迎使用海投助手，我将自动投递岗位！");
-      } else if (location.pathname.includes("/chat")) {
+        Core.log("欢迎使用海投助手，当前为" + (settings.aiGreetingEnabled ? "AI 半自动模式：点击职位卡片生成招呼语，确认后一键投递" : "全自动模式：点击「启动海投」批量沟通"));
+      } else if (PAGE.isChat()) {
         Core.log("欢迎使用海投助手，我将自动发送简历！");
-      } else if (location.pathname.includes("/notify-set")) {
-        Core.log("欢迎使用海投助手，我将自动启用招呼语功能！");
+      } else if (PAGE.isGreetSettings()) {
+        Core.log("欢迎使用海投助手，正在检测招呼语开关…");
         Core.handleGreetSettingsPage();
       } else {
-        Core.log("当前页面暂不支持，请移步至职位页面！");
+        Core.log("当前页面暂不支持，请打开 BOSS 直聘职位列表页（www.zhipin.com/web/geek/jobs）");
       }
     } catch (error) {
-      console.error("初始化失败:", error);
-      alert("ERR: "+error.message);
+      console.error("[海投助手] 初始化失败:", error);
+      // 不再使用 alert 打断用户，改为页面内提示，并保证面板仍可用
+      try {
+        if (typeof showNotification === "function") {
+          showNotification("海投助手初始化异常：" + error.message, "error");
+        }
+      } catch (e) {}
     }
   }
- 
-  init();
- 
-  let lastUrl = location.href;
-  new MutationObserver(() => {
-    const currentUrl = location.href;
-    if (currentUrl !== lastUrl) {
-      lastUrl = currentUrl;
-      if (UI.currentPageType === UI.PAGE_TYPES.JOB_LIST && !state.isRunning && location.pathname.includes("/jobs")) {
-        setTimeout(() => {
-          Core.loadAndDisplayComments();
-        }, 500);
+
+  /* ---------------- v2.1.0 新增：面板守护 & 单页路由切换 ---------------- */
+  let panelWatchdogTimer = null;
+
+  function startPanelWatchdog() {
+    if (panelWatchdogTimer) return;
+    panelWatchdogTimer = setInterval(() => {
+      try {
+        if (!document.body) return;
+        if (!document.getElementById("boss-pro-panel")) {
+          console.warn("[海投助手] 面板丢失，重新注入");
+          UI.createControlPanel();
+          if (!document.getElementById("boss-mini-icon") && !elements.miniIcon) {
+            UI.createMiniIcon();
+          }
+        }
+      } catch (e) {
+        console.error("[海投助手] 面板守护异常:", e);
       }
+    }, 3000);
+  }
+
+  let lastPageKey = PAGE.key();
+
+  function handleRouteChange() {
+    const key = PAGE.key();
+    if (key === lastPageKey) return;
+    lastPageKey = key;
+
+    console.log("[海投助手] 页面切换到:", key);
+
+    if (state.isRunning) {
+      state.isRunning = false;
+      state.currentIndex = 0;
+      state.jobList = [];
+      Core.log("页面已切换，已停止当前任务");
     }
-  }).observe(document, { subtree: true, childList: true });
- 
+
+    // BOSS 是单页应用，切换路由后旧面板内容不再适用，重建
+    try {
+      const oldPanel = document.getElementById("boss-pro-panel");
+      if (oldPanel) oldPanel.remove();
+      const oldMini = document.getElementById("boss-mini-icon");
+      if (oldMini) oldMini.remove();
+      elements.panel = null;
+      elements.miniIcon = null;
+      elements.controlBtn = null;
+      Core.clearDomCache();
+      UI.init();
+    } catch (e) {
+      console.error("[海投助手] 重建面板失败:", e);
+    }
+  }
+
+  init();
+
+  // 单页路由监听：同时监听 history 变化与 DOM 变化，双保险
+  (function watchRoute() {
+    ["pushState", "replaceState"].forEach((name) => {
+      const orig = history[name];
+      if (typeof orig !== "function") return;
+      history[name] = function () {
+        const ret = orig.apply(this, arguments);
+        setTimeout(handleRouteChange, 60);
+        return ret;
+      };
+    });
+    window.addEventListener("popstate", () => setTimeout(handleRouteChange, 60));
+
+    let lastHref = location.href;
+    const mo = new MutationObserver(() => {
+      if (location.href !== lastHref) {
+        lastHref = location.href;
+        setTimeout(handleRouteChange, 60);
+      }
+    });
+    if (document.documentElement) {
+      mo.observe(document.documentElement, { subtree: true, childList: true });
+    }
+  })();
+
   function addGreetingItem() {
     if (!state.settings.greetingsList) {
       state.settings.greetingsList = [];
     }
- 
+
     const hasEmpty = state.settings.greetingsList.some(
       (greeting) => !greeting.content.trim()
     );
@@ -4790,7 +6297,7 @@ updateGreetingPreview(text){var pv=document.getElementById("greeting-preview-tex
         <div style="display: flex; gap: 8px; align-items: center;">
           <span style="color: #6b7280; font-size: 12px; min-width: 20px;">${index + 1}.</span>
           <div style="flex: 1;">
-            <input type="text" class="greeting-input" data-id="${greeting.id}" value="${greeting.content}" placeholder="输入自我介绍内容" style="
+            <input type="text" class="greeting-input" data-id="${greeting.id}" placeholder="输入自我介绍内容" style="
               width: 100%;
               padding: 4px 6px;
               border: 1px solid #d1d5db;
@@ -4824,66 +6331,180 @@ updateGreetingPreview(text){var pv=document.getElementById("greeting-preview-tex
         state.settings.greetingsList = state.settings.greetingsList.filter(
           (g) => g.id !== greetingId
         );
-        StatePersistence.saveState();
+        saveSettings();
         renderGreetingsList();
       });
     });
- 
+
     document.querySelectorAll(".greeting-input").forEach((input) => {
+      const greetingId = input.dataset.id;
+      const greeting = (state.settings.greetingsList || []).find(
+        (g) => g.id === greetingId
+      );
+      // 用 property 赋值，避免内容里的引号破坏 HTML（旧版用 value="..." 会截断）
+      if (greeting) input.value = greeting.content || "";
+
       input.addEventListener("input", (e) => {
-        const greetingId = e.target.dataset.id;
-        const greeting = state.settings.greetingsList.find(
+        const target = (state.settings.greetingsList || []).find(
           (g) => g.id === greetingId
         );
-        if (greeting) {
-          greeting.content = e.target.value;
-          StatePersistence.saveState();
+        if (target) {
+          target.content = e.target.value;
+          debouncedSaveSettings();
         }
       });
     });
   }
- 
+
+  /* =========================================================================
+   * 简历文件解析（v2.1.0 修复：旧版直接对 .docx 做 UTF-8 文本搜索，
+   * 但 .docx 本质是 ZIP 压缩包，所以旧版"Word 导入"实际上永远解析不出内容）
+   * ========================================================================= */
+
+  /** 用浏览器原生 DecompressionStream 解压（Chrome/Edge 80+ 支持） */
+  async function inflateBytes(data, format) {
+    if (typeof DecompressionStream !== "function") {
+      throw new Error("当前浏览器不支持解压，请改用 .txt 或 .md 格式");
+    }
+    const ds = new DecompressionStream(format || "deflate-raw");
+    const stream = new Blob([data]).stream().pipeThrough(ds);
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+
+  /** 从 ZIP（docx）中取出指定文件的字节 */
+  async function unzipEntry(buffer, targetName) {
+    const u8 = new Uint8Array(buffer);
+    const dv = new DataView(buffer);
+    const utf8 = new TextDecoder("utf-8");
+
+    // 从尾部向前找 End Of Central Directory
+    let eocd = -1;
+    const minPos = Math.max(0, u8.length - 22 - 65536);
+    for (let i = u8.length - 22; i >= minPos; i--) {
+      if (dv.getUint32(i, true) === 0x06054b50) {
+        eocd = i;
+        break;
+      }
+    }
+    if (eocd < 0) throw new Error("不是有效的 docx 文件（未找到 zip 结构）");
+
+    const count = dv.getUint16(eocd + 10, true);
+    let off = dv.getUint32(eocd + 16, true);
+
+    for (let i = 0; i < count && off + 46 <= u8.length; i++) {
+      if (dv.getUint32(off, true) !== 0x02014b50) break;
+      const method = dv.getUint16(off + 10, true);
+      const compSize = dv.getUint32(off + 20, true);
+      const nameLen = dv.getUint16(off + 28, true);
+      const extraLen = dv.getUint16(off + 30, true);
+      const commentLen = dv.getUint16(off + 32, true);
+      const localOff = dv.getUint32(off + 42, true);
+      const name = utf8.decode(u8.subarray(off + 46, off + 46 + nameLen));
+
+      if (name === targetName) {
+        const lnameLen = dv.getUint16(localOff + 26, true);
+        const lextraLen = dv.getUint16(localOff + 28, true);
+        const dataStart = localOff + 30 + lnameLen + lextraLen;
+        const data = u8.subarray(dataStart, dataStart + compSize);
+        if (method === 0) return data;
+        if (method === 8) return await inflateBytes(data, "deflate-raw");
+        throw new Error("docx 使用了不支持的压缩方式：" + method);
+      }
+      off += 46 + nameLen + extraLen + commentLen;
+    }
+    throw new Error("docx 中未找到 " + targetName);
+  }
+
+  /** 解析 .docx：取出 word/document.xml 并还原为纯文本 */
+  async function extractTextFromDocx(buffer) {
+    const xml = new TextDecoder("utf-8").decode(
+      await unzipEntry(buffer, "word/document.xml")
+    );
+    return xml
+      .replace(/<w:tab[^>]*\/>/g, "\t")
+      .replace(/<\/w:p>/g, "\n")
+      .replace(/<w:br[^>]*\/>/g, "\n")
+      .replace(/<[^>]+>/g, "")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&amp;/g, "&")
+      .replace(/[ \t]+\n/g, "\n")
+      .trim();
+  }
+
+  /** 从 PDF 的文本对象里抽字（尽力而为，复杂排版/CID 字体可能识别不全） */
+  async function extractTextFromPdf(buffer) {
+    const latin1 = new TextDecoder("latin1").decode(new Uint8Array(buffer));
+
+    const decodePdfString = (s) =>
+      s
+        .replace(/\\([()\\])/g, "$1")
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\n")
+        .replace(/\\t/g, "\t")
+        .replace(/\\(\d{1,3})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
+
+    const collectFromContent = (content) => {
+      const out = [];
+      const re = /\(((?:\\.|[^\\()])*)\)\s*(?:Tj|TJ|'|")/g;
+      let m;
+      while ((m = re.exec(content))) out.push(decodePdfString(m[1]));
+      const arrRe = /\[([^\]]*)\]\s*TJ/g;
+      while ((m = arrRe.exec(content))) {
+        const inner = m[1];
+        const sRe = /\(((?:\\.|[^\\()])*)\)/g;
+        let s;
+        while ((s = sRe.exec(inner))) out.push(decodePdfString(s[1]));
+        out.push("");
+      }
+      return out.join(" ").replace(/\s{2,}/g, " ");
+    };
+
+    let text = "";
+    const streamRe = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+    let m;
+    while ((m = streamRe.exec(latin1))) {
+      const chunk = m[1];
+      let content = chunk;
+      if (!/BT[\s\S]*?ET/.test(chunk) && typeof DecompressionStream === "function") {
+        try {
+          const bytes = Uint8Array.from(chunk, (c) => c.charCodeAt(0) & 0xff);
+          content = new TextDecoder("latin1").decode(
+            await inflateBytes(bytes, "deflate")
+          );
+        } catch (e) {
+          continue;
+        }
+      }
+      if (/BT[\s\S]*?ET/.test(content)) text += collectFromContent(content) + "\n";
+    }
+
+    text = text.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    if (text.length < 10) {
+      throw new Error(
+        "无法从该 PDF 提取文本（可能是扫描件或使用了特殊字体），请另存为 .docx / .txt 后导入"
+      );
+    }
+    return text;
+  }
+
+  /** 输入时不必每敲一个字就写一次 localStorage */
+  let saveSettingsTimer = null;
+  function debouncedSaveSettings() {
+    if (saveSettingsTimer) clearTimeout(saveSettingsTimer);
+    saveSettingsTimer = setTimeout(() => {
+      saveSettingsTimer = null;
+      saveSettings();
+    }, 400);
+  }
+
   function loadGreetings() {
-    if (!state.settings.greetingsList) {
-      state.settings.greetingsList = [];
+    if (!state.settings.greetingsList || state.settings.greetingsList.length === 0) {
+      state.settings.greetingsList = [{ id: Date.now().toString(), content: "" }];
+      saveSettings();
     }
     renderGreetingsList();
-  }
- 
-  function loadSettingsIntoUI() {
-    const aiRoleInput = document.getElementById("ai-role-input");
-    if (aiRoleInput) {
-      aiRoleInput.value = settings.ai.role;
-    }
- 
-    const autoReplyInput = document.querySelector(
-      "#toggle-auto-reply-mode input"
-    );
-    if (autoReplyInput) {
-      autoReplyInput.checked = settings.autoReply;
-    }
- 
-    const autoSendResumeInput = document.querySelector(
-      "#toggle-auto-send-resume input"
-    );
-    if (autoSendResumeInput) {
-      autoSendResumeInput.checked = settings.useAutoSendResume;
-    }
- 
-    const excludeHeadhuntersInput = document.querySelector(
-      "#toggle-exclude-headhunters input"
-    );
-    if (excludeHeadhuntersInput) {
-      excludeHeadhuntersInput.checked = settings.excludeHeadhunters;
-    }
- 
-    const autoSendImageResumeInput = document.querySelector(
-      "#toggle-auto-send-image-resume input"
-    );
-    if (autoSendImageResumeInput) {
-      autoSendImageResumeInput.checked = settings.useAutoSendImageResume;
-    }
- 
-    loadGreetings();
   }
 })();
