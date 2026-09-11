@@ -159,7 +159,7 @@
       excludeHeadhunters: getStoredJSON("excludeHeadhunters", false),
       imageResumes: getStoredJSON("imageResumes", []),
       greetingsList: getStoredJSON("greetingsList", [
-        { id: "1", content: "您好！我是杨圣洲，江西科技师范大学信息管理与信息系统专业 2026 届本科生。我学习能力强、上手快，执行力高，非常希望加入贵团队长期稳定发展。" },
+        { id: "1", content: "您好！我是Peter，北京大学信息管理与信息系统专业 2026 届本科生。我学习能力强、上手快，执行力高，非常希望加入贵团队长期稳定发展。" },
         { id: "2", content: "技术上，我掌握 Linux 系统、容器与云服务基础，熟悉 Vue、SpringCloud、Redis、MySQL、MongoDB、PostgreSQL、Kotlin、Flutter 等技术栈，可熟练使用 Java/Python 完成全栈开发与数据库开发。" },
         { id: "3", content: "个人 GitHub：https://github.com/YangShengzhou03 Docker 仓库：https://hub.docker.com/repository/docker/yangshengzhou/" },
         { id: "4", content: "在校期间荣获国家奖学金、ACM 竞赛银牌、蓝桥杯 Python 组国家级一等奖，通过大学英语四六级，专业基础扎实，做事踏实高效。" }
